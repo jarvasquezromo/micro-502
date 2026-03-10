@@ -1,6 +1,8 @@
 # Low-level PID control of velocity and attitude
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
+matplotlib.use('TkAgg')
 from lib.simple_pid import PID
 from scipy.spatial.transform import Rotation as R
 
@@ -12,10 +14,10 @@ class quadrotor_controller():
         ### START EXERCISE 1 tuning part ###
         # Only change the gains you are asked to, the others are already tuned by us (INITIAL GAINS)
         gains = {
-                    "P_pos_z": 8.0,     "I_pos_z": 0.0,     "D_pos_z": 0.8,
-                    "P_pos_xy": 0.5,    "I_pos_xy": 0.0,    "D_pos_xy": 0.0,
-                    "P_vel_z": 2.0,     "I_vel_z": 0.0,     "D_vel_z": 1.0,
-                    "P_vel_xy": 0.2,    "I_vel_xy": 0.0,    "D_vel_xy": 0.0,
+                    "P_pos_z": 2.0,     "I_pos_z": 0.0,     "D_pos_z": 0.1,
+                    "P_pos_xy": 2.5,    "I_pos_xy": 0.0,    "D_pos_xy": 0.1,
+                    "P_vel_z": 4.5,     "I_vel_z": 0.0,     "D_vel_z": 1.0,
+                    "P_vel_xy": 0.7,    "I_vel_xy": 0.0,    "D_vel_xy": 0.0,
                     "P_att_rp": 10.0,   "I_att_rp": 0.0,    "D_att_rp": 0.2,
                     "P_att_y": 4.0,     "I_att_y": 0.0,     "D_att_y": 0.3,
                     "P_rate_rp": 1.5,   "I_rate_rp":0.0,    "D_rate_rp": 0.1,
@@ -118,30 +120,30 @@ class quadrotor_controller():
             setpoint[2] = self.tuning(0.5, 1.5, 5, dt, setpoint[2], sensor_data["z_global"], "z position [m]")
 
         # Position error in inertial frame (use sensor_data["x_global"], sensor_data["y_global"], sensor_data["z_global"])
-        # pos_x_error = 
-        # pos_y_error = 
-        # pos_z_error = 
-        # yaw_setpoint = 
+        pos_x_error = setpoint[0] - sensor_data['x_global']
+        pos_y_error = setpoint[1] - sensor_data['y_global']
+        pos_z_error = setpoint[2] - sensor_data['z_global']
+        yaw_setpoint = setpoint[3]
 
         # Calculate rotation
         # R_current = 
-        # R_body_to_inertial =   # Rotation from body to inertial frame
-        # R_inertial_to_body =   # Inverse (transpose for rotation matrices)
+        R_body_to_inertial = R.from_quat( np.array([sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']])) # Rotation from body to inertial frame
+        R_inertial_to_body = R_body_to_inertial.as_matrix().T # Inverse (transpose for rotation matrices)
 
         # Rotate position error into body frame
-        # pos_error_inertial = 
-        # pos_error_body = 
-        # pos_x_error, pos_y_error, pos_z_error = pos_error_body
+        pos_error_inertial = np.array([pos_x_error, pos_y_error, pos_z_error])
+        pos_error_body = R_inertial_to_body @ pos_error_inertial
+        pos_x_error, pos_y_error, pos_z_error = pos_error_body
 
         # Put setpoint of PID controller
-        # self.pid_pos_x.set_setpoint(???)
-        # self.pid_pos_y.set_setpoint(???)
-        # self.pid_pos_z.set_setpoint(???)
+        self.pid_pos_x.set_setpoint(pos_x_error)
+        self.pid_pos_y.set_setpoint(pos_y_error)
+        self.pid_pos_z.set_setpoint(pos_z_error)
 
         # Call PID controller
-        # vel_x_setpoint = self.pid_pos_x.call(0, dt=dt)
-        # vel_y_setpoint = self.pid_pos_y.call(0, dt=dt)
-        # vel_z_setpoint = self.pid_pos_z.call(0, dt=dt)
+        vel_x_setpoint = self.pid_pos_x.call(0, dt=dt)
+        vel_y_setpoint = self.pid_pos_y.call(0, dt=dt)
+        vel_z_setpoint = self.pid_pos_z.call(0, dt=dt)
         
         # For tuning
         if self.tuning_level == "vel_xy":
@@ -150,17 +152,17 @@ class quadrotor_controller():
             vel_z_setpoint = self.tuning(-self.limits["L_vel_z"], self.limits["L_vel_z"], 2, dt, vel_z_setpoint, sensor_data["v_z"], "z velocity [m/s]")
 
         # Put setpoint of PID controller
-        # self.pid_vel_x.set_setpoint(???)
-        # self.pid_vel_y.set_setpoint(???)
-        # self.pid_vel_z.set_setpoint(???)
+        self.pid_vel_x.set_setpoint(vel_x_setpoint)
+        self.pid_vel_y.set_setpoint(vel_y_setpoint)
+        self.pid_vel_z.set_setpoint(vel_z_setpoint)
         
         # Call PID controller (use sensor_data["v_forward"], sensor_data["v_left"], sensor_data["v_up"])
-        # acc_x_setpoint = self.pid_vel_x.call(???, dt=dt)
-        # acc_y_setpoint = self.pid_vel_y.call(???, dt=dt)
-        # acc_z_setpoint = self.pid_vel_z.call(???, dt=dt)
+        acc_x_setpoint = self.pid_vel_x.call(sensor_data["v_forward"], dt=dt)
+        acc_y_setpoint = self.pid_vel_y.call(sensor_data["v_left"], dt=dt)
+        acc_z_setpoint = self.pid_vel_z.call(sensor_data["v_up"], dt=dt)
 
-        # return self.acceleration_and_yaw_to_pwm(dt, [acc_x_setpoint, acc_y_setpoint, acc_z_setpoint], yaw_setpoint, sensor_data)
-        return self.acceleration_and_yaw_to_pwm(dt, [0, 0, 0], 0, sensor_data) #replace this with the line above
+        return self.acceleration_and_yaw_to_pwm(dt, [acc_x_setpoint, acc_y_setpoint, acc_z_setpoint], yaw_setpoint, sensor_data)
+        # return self.acceleration_and_yaw_to_pwm(dt, [0, 0, 0], 0, sensor_data) #replace this with the line above
     
         ### END EXERCISE 1 implementation part ###
     
