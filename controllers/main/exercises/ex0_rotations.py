@@ -70,11 +70,11 @@ def rot_inertial2body(control_commands, euler_angles, quaternion):
     #           control_commands: A list of 4 control commands [vel_x, vel_y, altitude, yaw_rate] in the body reference frame
 
     # --- YOUR CODE HERE ---
-    vel_inertial = control_commands[:2] + [0.0]
-    R = euler2rotmat(euler_angles)
-    vel_body = R.T @ vel_inertial
+    # vel_inertial = control_commands[:2] + [0.0]
+    # R = euler2rotmat(euler_angles)
+    # vel_body = R.T @ vel_inertial
    
-    control_commands = vel_body.tolist()[:2] + control_commands[2:]
+    # control_commands = vel_body.tolist()[:2] + control_commands[2:]
 
     # --- SAMPLE SOLUTION ---
     vel_inertial = np.array([control_commands[0], control_commands[1], 0.0])
