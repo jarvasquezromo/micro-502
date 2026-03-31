@@ -13,6 +13,7 @@ from scipy.spatial.transform import Rotation as R
 import lib.mapping_and_planning_examples as mapping_and_planning_examples
 import time, random
 import threading
+import cv2
 
 exp_num = 4                    # 0: Coordinate Transformation, 1: PID Tuning, 2: Kalman Filter, 3: Motion Planning, 4: Project
 control_style = 'path_planner'      # 'keyboard' or 'path_planner'
@@ -723,6 +724,11 @@ if __name__ == '__main__':
 
                         # Read the camera feed
                         camera_data = drone.read_camera()
+                        detection = assignment.show_mask(camera_data)
+
+                        cv2.imshow ("Real camera", camera_data)
+                        cv2.imshow ("Detection", detection)
+                        cv2.waitKey(1)
                         
                         # Update the sensor data in the thread
                         with sensor_lock:
