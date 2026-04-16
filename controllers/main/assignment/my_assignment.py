@@ -1,7 +1,6 @@
 import cv2
-import time
 import numpy as np
-from typing import Tuple
+from typing import Tuple, List, Union, Dict
 
 from scipy.spatial.transform import Rotation as R
 
@@ -28,7 +27,12 @@ from lib.a_star_3D import AStar3D
 # "q_w": W Quaternion value
 
 # A link to further information on how to access the sensor data on the Crazyflie hardware for the hardware practical can be found here: https://www.bitcraze.io/documentation/repository/crazyflie-firmware/master/api/logs/#stateestimate
-
+import logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 class MyAssignment:
     SEGMENT_LOCATION_GATES = [2, 4, 6, 8, 10]
@@ -42,15 +46,24 @@ class MyAssignment:
         # ---- INITIALISE YOUR VARIABLES HERE ----
         self.R_yaw90 = R.from_euler('xyz', [0, 0, np.pi / 2]).as_matrix()
 
-        self.mode = 0 # 0: searching gates, 1: go to segment 0, 2: fast mode, 3: finish
-        self.trajectory_mode = 0 
+        self.mode = Keeper() # 0: searching gates, 1: go to segment 0, 2: fast mode, 3: finish
+        self.mode_trajectory = Keeper() 
         # 0: waiting for waypoints
         # 1: computing trajectory from start and goal
         # 2: compute trajectory from waypoints
         # 3: running trajectory
+        self.mode_searching = Keeper()
+        # 0: go to position of searching
+        # 1: turn around to look for the gate
+        # 2: go near the gate
+        # 3: confirm position of gate
+        # 4: go from actual position, through the gate to the next position
         
         self.pos_gates = []
+        self.idx_gate_search = 0
         self.trajectory = []
+        self.last_command = None
+        self.target_control_command = None
 
         self.obstacles = []
         self.start = (0.0, 0.0, 0.5)
@@ -58,6 +71,7 @@ class MyAssignment:
         self.mp = MotionPlanner3D()
 
         self.tracker = Tracker()
+        self.detector = GatesDetector()
 
     def run_motion_planing (self, start, goal, obstacles):
         self.mp.run_motion_planner(start, obstacles, self.MP_BOUNDS, self.MP_GRID_SIZE, goal)
@@ -66,7 +80,6 @@ class MyAssignment:
         if erase_obstacles: self.mp.obstacles = []
         
         # Compute trajectory
-        self.mp.init_params(trajectories)
         self.mp.run_planner(trajectories)
         self.trajectory_setpoints, self.time_setpoints = self.mp.trajectory_setpoints, self.mp.time_setpoints
 
@@ -78,47 +91,102 @@ class MyAssignment:
         # Take off example
         if sensor_data['z_global'] < 0.49:
             control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.0, sensor_data['yaw']]
-            return control_command
+        else:
 
         # ---- YOUR CODE HERE ----
-        
-        control_command = self.get_next_waypoint (sensor_data, dt)
-        if self.trajectory_mode != 0: # TODO: Trajectory 
-            return control_command
+            if self.mode_trajectory != 0: # Trajectory (priority)
+                control_command = self.get_next_waypoint (sensor_data, dt)
+            elif self.mode == 0: # TODO: Searching
+                control_command = self.search_gates (sensor_data, camera_data)
+            elif self.mode == 1: # TODO: Go to segment 0
+                control_command = self.INIT_POS
+            elif self.mode == 2: # TODO: Fast mode
+                control_command = self.fast_mode (sensor_data, camera_data)
+            else: # TODO: Finish
+                control_command = self.dancing (sensor_data)
 
-        if self.mode == 0: # TODO: Searching
-            control_command = self.search_gates (sensor_data, camera_data)
-        elif self.mode == 1: # TODO: Go to segment 0
-            control_command = self.INIT_POS
-        elif self.mode == 2: # TODO: Fast mode
-            control_command = self.fast_mode (sensor_data, camera_data)
-        else: # TODO: Finish
-            control_command = self.dancing (sensor_data)
+            # Updateing mode
+            if len(control_command) != 4:
+                logger.warning("Your control its bad: %s", str(control_command))
+            pos = np.array([sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global']])
+            actual_segment = self._get_actual_segment(pos)
+            self.update_mode(actual_segment, pos)
 
-        pos = np.array([sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global']])
-        actual_segment = self._get_actual_segment(pos)
-        self.update_mode(actual_segment, pos)
-
-        control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.0, np.deg2rad(45)]
+        # DEBUG
+        # control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.0, np.deg2rad(45)]
+        self.last_command = control_command
         return control_command # Ordered as array with: [pos_x_cmd, pos_y_cmd, pos_z_cmd, yaw_cmd] in meters and radians
     
     def search_gates (self, sensor_data, camera_data):
-        # Method 1
+        # Default values
+        actual_pos = np.array([
+            sensor_data['x_global'], sensor_data['y_global'], 
+            sensor_data['z_global'], sensor_data['yaw']]
+        )
+        drone_rot = R.from_euler(
+            'xyz', 
+            [sensor_data['roll'], sensor_data['pitch'], sensor_data['yaw']]
+        )
+        control_command = actual_pos.copy()
+
         # Detect gates
-        self._detect_gates (camera_data)
+        _, gates = self.detector.pink_mask(camera_data)
+        gates_positions = self.detector.compute_gates_position(gates, drone_rot, actual_pos[:3])
+        idx_gate = self._get_idx_gate_search(gates_positions, self.idx_gate_search)
+    
+        if self.mode_searching == 0: 
+            if len(gates) == 0 or idx_gate is None:
+                if self.target_control_command is None:
+                    self.mode_searching.set(1)
+                else:
+                    control_command = self.target_control_command
+            else:
+                # We have the gate position
+                control_command = self._compute_space_to_pos(gates_positions[idx_gate]["command"], -0.4)
+                control_command[2] = np.clip(control_command[2], 0.9, 1.8)
+                self.target_control_command = control_command
 
-        # If you dont see: turn
-        # If you see one: go to the gate to take a better position
-        # If you see one in a good distance: save it in obstacles and in gate positions and go for other one
+            # If we get the target pos
+            if self.target_control_command is not None \
+                and self._achieve_goal(actual_pos, self.target_control_command):
+                # If we dont see the gate, look again
+                if idx_gate is None or (not gates_positions[idx_gate]["valid"]):
+                    self.target_control_command = None
+                    self.mode_searching.set(1)
+                else:
+                    logger.debug ("saving gate")
+                    self.pos_gates.append(gates_positions[idx_gate]["command"])
+                    self.mode_searching.set(2)
+                    self.idx_gate_search += 1
+                    self.target_control_command = None
 
-        # Method 2
-        # Go to segment 1: detect gate in segment 2
-        # Go to segment 3: detect gate in segment 4
-        # Go to segment 5: detect gate in segment 6
-        # Go to segment 7: detect gate in segment 8
-        # Go to segment 9: detect gate in segment 10
+        elif self.mode_searching == 1: # Keep rotating
+            if len(gates) > 0 and idx_gate is not None:
+                self.mode_searching.set(0)
+            else:
+                # Go to the segment before of the gate and rotate.
+                midle_pos = self._get_midle_point_segment(
+                    self.SEGMENT_LOCATION_GATES[self.idx_gate_search] - 1)
+                
+                # Review only the position, not the yaw
+                if self._achieve_goal(actual_pos[:3], midle_pos[:3]):
+                    control_command[3] += np.deg2rad(15)
+                else:
+                    control_command = midle_pos
 
+        elif self.mode_searching == 2: # Pass thorogh gate and a little bit more
+            self.trajectory = [
+                actual_pos[:3],
+                self.pos_gates[-1],
+                self._compute_space_to_pos(self.pos_gates[-1], 0.5)
+            ]
+            self.mode_trajectory.set(2)
+            self.mode_searching.set(0)
 
+        else:
+            raise ValueError (f"Wrong value of searching mode ({self.mode_searching})")
+        
+        return control_command
 
     def fast_mode (self, sensor_data, camera_data):
         # Method 1: Start far form start and gete velocity
@@ -130,29 +198,31 @@ class MyAssignment:
             sensor_data['x_global'], sensor_data['y_global'], 
             sensor_data['z_global'], sensor_data['yaw']
         ]
-
-        if self.trajectory_mode == 0:
-            return False, control_command
-        elif self.trajectory_mode == 1:
+        
+        # mode_trajectory: 0 waiting for waypoints
+        if self.mode_trajectory == 1:
             # Compute trajectory
             self.run_motion_planing(self.start, self.goal, self.obstacles)
+            self.tracker.reset()
 
             # Change mode
-            self.trajectory_mode = 3
-            return False, control_command
-        elif self.trajectory_mode == 2:
+            self.mode_trajectory.set(3)
+            return control_command
+        elif self.mode_trajectory == 2:
             # Compute trajectory form waypoints
             self.run_planner(self.trajectory, True)
+            self.tracker.reset()
 
             # Change mode
-            self.trajectory_mode = 3
-            return False, control_command
-        elif self.trajectory_mode == 3:
+            self.mode_trajectory.set(3)
+            return control_command
+        elif self.mode_trajectory == 3:
             control_command, done = self.tracker.trajectory_tracking (
                 sensor_data, dt, self.time_setpoints, self.trajectory_setpoints, self.GOAL_TOL)
             
-            if done: self.trajectory_mode = 0
-            return True, control_command
+            if done: self.mode_trajectory.set(0)
+        
+        return control_command
 
     def dancing (self, sensor_data): # TODO
         pass
@@ -164,36 +234,33 @@ class MyAssignment:
                 location_gates = []
 
                 for p_gate in self.pos_gates:
-                    segment = self._get_actual_segment(p_gate)
+                    segment = self._get_actual_segment(p_gate[:3])
                     location_gates.append(segment)
 
                 if sorted(location_gates) == sorted(self.SEGMENT_LOCATION_GATES):
                     # We have all the gates, we can run
-                    self.mode += 1
+                    self.mode.set()
         elif self.mode == 1:
             # Check if we are in segment 0
             if np.linalg.norm(pos - self.INIT_POS) < 1e-2:
-                self.mode += 1
+                self.mode.set()
         elif self.mode == 2:
             # Check if we pass through all the gates and went to zero
             # TODO: check each gate
 
             if actual_segment == 0:
-                self.mode += 1
+                self.mode.set()
         else:
             # Finish or something else
             pass
 
     def _get_actual_segment (self, global_pos):
-        # Fixed coordinates
-        centered = (global_pos - np.array([4, 4, 0])) * np.array([1, 1, 1])
-        rotated = self.R_yaw90 @ (centered)
-
-        # Get theta
-        theta = np.arctan2 (rotated[1], rotated[0])
+        # Get cinlindrical coords
+        _, theta, _ = self._coord_to_cilindrical(global_pos)
         dtheta = np.rad2deg (theta)
         
         # TODO: make beauty
+        segment = None
         if dtheta < -165 or dtheta > 165:   segment = 9
         elif -165 <= dtheta < -135:         segment = 10
         elif -135 <= dtheta < -105:         segment = 11
@@ -208,9 +275,100 @@ class MyAssignment:
         elif  135 <= dtheta <  165:         segment = 8
 
         return segment
+    
+    def _get_actual_segment_math (self, global_pos):
+        # Get cinlindrical coords
+        _, theta, _ = self._coord_to_cilindrical(global_pos)
+        theta_deg = np.rad2deg (theta)
+        
+        # TODO: make beauty
 
-    def _detect_gates (self, camera_data):
-        pass
+        if theta_deg < -165 or theta_deg > 165:   segment = 9
+        elif -165 <= theta_deg < -135:         segment = 10
+        elif -135 <= theta_deg < -105:         segment = 11
+        elif -105 <= theta_deg <  -75:         segment = 0
+        elif  -75 <= theta_deg <  -45:         segment = 1
+        elif  -45 <= theta_deg <  -15:         segment = 2
+        elif  -15 <= theta_deg <   15:         segment = 3
+        elif   15 <= theta_deg <   45:         segment = 4
+        elif   45 <= theta_deg <   75:         segment = 5
+        elif   75 <= theta_deg <  105:         segment = 6
+        elif  105 <= theta_deg <  135:         segment = 7
+        elif  135 <= theta_deg <  165:         segment = 8
+
+        return segment
+    
+    def _cilindrical_to_coord (self, r, theta, z):
+        x_centered = r * np.cos(theta)
+        y_centered = r * np.sin(theta)
+
+        rotated_pos = self.R_yaw90.T @ np.array([x_centered, y_centered, z])
+
+        global_pos = rotated_pos + np.array([4, 4, 0])
+
+        return global_pos
+
+    def _coord_to_cilindrical (self, global_pos):
+        # Fixed coordinates
+        centered = (global_pos - np.array([4, 4, 0])) * np.array([1, 1, 1])
+        rotated = self.R_yaw90 @ (centered)
+
+        # Get theta
+        theta = np.arctan2 (rotated[1], rotated[0])
+
+        # return r, theta, z
+        return np.linalg.norm (centered), theta, global_pos[2]
+    
+    def _achieve_goal (self, pos, goal, tol=None) -> bool:
+        tol = self.GOAL_TOL if tol is None else tol
+        if np.linalg.norm(pos - goal) < tol: 
+            return True
+        return False
+
+    def _get_midle_point_segment (self, segment):
+        # Get position in theta
+        obj_theta = segment * np.deg2rad(30) - np.deg2rad(90)
+
+        # Get in global pos
+        global_pos = self._cilindrical_to_coord(3, obj_theta, 1.35)
+
+        return np.concatenate([global_pos, [obj_theta + np.deg2rad(0)]])
+
+    def _compute_space_to_pos (self, pos, dist) -> np.ndarray:
+        """
+        Compute the position a certain distance to the given position
+        
+        :param pos: Given position size (4,) with (x, y, z, yaw)
+        :param dist: Distance to the position in meters
+        :return: The position with distance dist away of the posistion given
+        :rtype: ndarray
+        """ 
+        # Get the normal vector
+        normal = np.array([np.cos(pos[3]), np.sin(pos[3]), 0.0])
+
+        # Target position
+        target_pos = pos[:3] + normal * dist
+        target_pos[2] = pos[2]
+
+        return np.concatenate([target_pos, [pos[3]]])
+
+    def _get_idx_gate_search (self, gates_positions, idx_gate_search) -> int:
+        """
+        Get the index of the gate that we are searching for.
+        
+        :param gates_positions: Positions of the gates
+        :param idx_gate_search: index of the gate that we are looking for
+        :return: index of the gate in self.SEGMENT_LOCATION_GATES
+        :rtype: int
+        """
+        segments = [self._get_actual_segment(pos["command"][:3]) for pos in gates_positions]
+
+        try: 
+            idx_gate = segments.index(self.SEGMENT_LOCATION_GATES[idx_gate_search])
+        except ValueError:
+            idx_gate = None
+
+        return idx_gate
 
 class GatesDetector:
 
@@ -218,12 +376,23 @@ class GatesDetector:
     CAM_WIDTH = 300
     CAM_HEIGHT = 300
 
-    CAM_FOCAL_DIST = CAM_WIDTH / (1 * np.tan(CAM_FIELD_OF_VIEW / 2))
+    CAM_FOCAL_DIST = CAM_WIDTH / (2 * np.tan(CAM_FIELD_OF_VIEW / 2))
+
+    CAM_POS_REL = np.array([0.03, 0.0, 0.01])
+    CAM_ROT_REL = R.from_euler('xz', [-np.deg2rad(90), -np.deg2rad(90)])
 
     GATE_HEIGHT = 0.4 # m
 
     def __init__ (self):
-        pass
+        self.k = np.array([
+            [self.CAM_FOCAL_DIST, 0, self.CAM_WIDTH / 2],
+            [0, self.CAM_FOCAL_DIST, self.CAM_HEIGHT / 2],
+            [0, 0, 1]
+        ])
+        self.inv_k = np.linalg.inv(self.k)
+
+        self.gates = []
+        self.sensor_data = []
 
     def pink_mask (self, camera_data):
         # https://stackoverflow.com/questions/70071741/opencv-python-how-recognize-pink-wood-in-the-image
@@ -235,12 +404,12 @@ class GatesDetector:
         COLOR_MIN = np.array([140, 50, 80], np.uint8) 
         COLOR_MAX = np.array([170, 255, 255], np.uint8)
 
-        frame_threshed = cv2.inRange(hsv_img, COLOR_MIN, COLOR_MAX)     # Thresholding image
+        frame_threshed = cv2.inRange(hsv_img, COLOR_MIN, COLOR_MAX)
         ret, thresh = cv2.threshold(frame_threshed, 127, 255, 0)
 
         img_points, gates = self.find_boxes (frame_threshed, img)
 
-        return img_points
+        return img_points, gates
 
     def find_boxes (self, mask, img):
         contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
@@ -275,27 +444,99 @@ class GatesDetector:
 
         return img, gates
     
-    def compute_gates_position (self, gates_corners):
+    def compute_gates_position (
+            self, gates_corners, R_drone_to_world: R, T_drone_to_world: np.ndarray
+        ) -> List[Dict[str, Union[np.ndarray, bool]]]:
         positions = []
         for gate in gates_corners:
-            left_dist_px = np.linalg.norm (gate[0] - gate[3])
-            right_dist_px = np.linalg.norm (gate[1] - gate[2])
 
-            left_dist = self.get_distance(left_dist_px, self.GATE_HEIGHT)
-            right_dist = self.get_distance(right_dist_px, self.GATE_HEIGHT)
+            cam_rel_pos_left = self.get_rel_center_pos (gate[0], gate[3], self.GATE_HEIGHT)
+            cam_rel_pos_right = self.get_rel_center_pos (gate[1], gate[2], self.GATE_HEIGHT)
 
-            # TODO: compute gate positions
-            # mean point, of the points
+            # Transform to world frame
+            drone_rel_pos_left = self.CAM_ROT_REL.apply(cam_rel_pos_left) + self.CAM_POS_REL
+            gate_pos_left = R_drone_to_world.apply(drone_rel_pos_left) + T_drone_to_world
+
+            drone_rel_pos_right= self.CAM_ROT_REL.apply(cam_rel_pos_right) + self.CAM_POS_REL
+            gate_pos_right = R_drone_to_world.apply(drone_rel_pos_right) + T_drone_to_world
+
+            valid_gate = False
+            if np.linalg.norm(gate_pos_left - gate_pos_right) > 0.29:
+                valid_gate = True
+
+            # Center position
+            gate_center = (gate_pos_left + gate_pos_right) / 2
+
+            # Gate orientation
+            lateral = gate_pos_right - gate_pos_left
+            drone_to_gate = gate_center - T_drone_to_world
+            normal = np.array([-lateral[1], lateral[0], 0])
+
+            # Flip normal if it points away from the drone
+            if np.dot(normal, drone_to_gate) < 0:
+                normal = -normal
+            gate_yaw = np.arctan2(normal[1], normal[0])
+
+            positions.append({
+                "command": np.concatenate([gate_center, [gate_yaw]]),
+                "valid": valid_gate
+            })
+
+        return positions
+
+    def get_rel_center_pos (self, pos_pixel_top: np.ndarray, pos_pixel_bottom: np.ndarray, real_dist: float) -> np.ndarray:
+        """
+        Get the relative position of the center point between top and bottom (or different points) of 
+        an object where you know the real distance between each point.
+        
+        :param pos_pixel_top: Position of the pixel in camera frame
+        :param pos_pixel_bottom: Position of the pixel in camera frame
+        :param real_dist: Real distance in meter between each point.
+        :return: Relative position of the center point between points in camera frame (in meters).
+        :return type: np.ndarray of shape (3,)
+
+        NOTE: This position will be not accurate if the object is rotated, try to go closer and get a
+        better aproximation.
+        """
+
+        # Get distnace to arist
+        dist_between_pixels = np.linalg.norm (pos_pixel_top - pos_pixel_bottom)
+        dist_to_center = self.get_distance(dist_between_pixels, real_dist)
+
+        # Get x,y rates
+        pos_center_pixel = (pos_pixel_top + pos_pixel_bottom) / 2
+        pixel = np.concatenate([pos_center_pixel, [1]])
+        pos_rate = self.inv_k @ pixel
+
+        # Get position relative to camera
+        p_z = dist_to_center / np.linalg.norm (pos_rate)
+        p_y = pos_rate[1] * p_z
+        p_x = pos_rate[0] * p_z
+
+        return np.array([p_x, p_y, p_z])
 
     def get_distance (self, dist_px, size_object):
-        return size_object * self.CAM_FOCAL_DIST / dist_px # meters
+        return size_object * self.CAM_FOCAL_DIST / max(dist_px, 1e-6) # meters
+        
+    def compute_gate_position (self, gate_corners, sensor) -> Tuple[np.ndarray, bool]:
+        self.gates.append(gate_corners)
+        self.sensor_data.append(sensor)
+
+        if len(self.gates) > 1:
+            # Compute the position
+            pass
+        else:
+            return None, False
     
 class Tracker:
     def __init__ (self):
+        self.reset()
+
+    def reset(self):
         self.index_current_setpoint = None
         self.timer = None
         self.timer_done = None
-
+        
     def trajectory_tracking(self, sensor_data, dt, timepoints, setpoints, tol, repeat = False):
 
         start_point = setpoints[0]
@@ -542,11 +783,32 @@ class MotionPlanner3D():
         # ---------------------------------------------------------------------------------------------------- ##
 
         return trajectory_setpoints, time_setpoints
+
+class Keeper ():
+    def __init__ (self, value_default=0):
+        self.value = value_default
+        self.last = value_default
+
+    def set(self, value=None):
+        if value is None:
+            value = self.value + 1
+
+        self.last = self.value 
+        self.value = value
+
+    def get(self):
+        return self.value
     
-
-
-
-
+    def return_to_last(self):
+        now_value = self.value 
+        self.value = self.last 
+        self.last = now_value
+    
+    def __eq__(self, other):
+        return self.value == other
+    
+    def __repr__(self):
+        return str(self.value)
 
 # Module-level singleton so main.py can call assignment.get_command() unchanged
 _controller = MyAssignment()
@@ -556,7 +818,49 @@ def get_command(sensor_data, camera_data, dt):
     return _controller.compute_command(sensor_data, camera_data, dt)
 
 def show_mask (camera_data):
-    return _detector.pink_mask(camera_data)
+    img, _ = _detector.pink_mask(camera_data)
+    return img
+
+def draw_stats(image: np.ndarray = None) -> np.ndarray:
+    """Draw stats overlay on the image."""
+    stats = [
+        f"Mode:        {_controller.mode}",
+        f"Mode Search: {_controller.mode_searching}",
+        f"Mode Traj:   {_controller.mode_trajectory}",
+        f"Gate idx:    {_controller.idx_gate_search}",
+        f"Target:      {np.round(_controller.target_control_command, 2) if _controller.target_control_command is not None else 'None'}",
+        # add whatever variables you want
+    ]
+
+    # Semi-transparent background
+    if image is None:
+        image = np.zeros((300, 300, 3), dtype=np.uint8)
+    overlay = image.copy()
+    cv2.rectangle(overlay, (5, 5), (300, 20 + 25 * len(stats)), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.4, image, 0.6, 0, image)
+
+    # Draw each line
+    for i, line in enumerate(stats):
+        cv2.putText(
+            image,
+            line,
+            (10, 25 + i * 25),        # x, y position (moves down each line)
+            cv2.FONT_HERSHEY_SIMPLEX,  # font
+            0.6,                        # font scale
+            (0, 255, 0),               # color (green)
+            1,                          # thickness
+            cv2.LINE_AA                # anti-aliased
+        )
+
+    return image
 
 if __name__ == "__main__":
-    print(_controller._get_actual_segment(np.array([4.1, 4, 0])))
+    pos = np.array([4.1, 4, 0])
+    pos = np.array([1, 4, 0.1])
+    print(_controller._get_actual_segment(pos))
+
+    cilindrical = _controller._coord_to_cilindrical(pos)
+    print(cilindrical[0], np.rad2deg(cilindrical[1]), cilindrical[2])
+    
+    new_pos = _controller._cilindrical_to_coord(*cilindrical)
+    print(new_pos)

@@ -725,9 +725,11 @@ if __name__ == '__main__':
                         # Read the camera feed
                         camera_data = drone.read_camera()
                         detection = assignment.show_mask(camera_data)
+                        stats = assignment.draw_stats(camera_data)
 
                         cv2.imshow ("Real camera", camera_data)
                         cv2.imshow ("Detection", detection)
+                        # cv2.imshow ("Stats", stats)
                         cv2.waitKey(1)
                         
                         # Update the sensor data in the thread
