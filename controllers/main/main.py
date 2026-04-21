@@ -29,6 +29,8 @@ setpoint_lock = threading.Lock()
 
 running = True
 
+np.random.seed(0)
+
 # Crazyflie drone class in webots
 class CrazyflieInDroneDome(Supervisor):
     def __init__(self):
@@ -724,7 +726,7 @@ if __name__ == '__main__':
 
                         # Read the camera feed
                         camera_data = drone.read_camera()
-                        detection = assignment.show_mask(camera_data)
+                        detection = assignment.show_mask(camera_data, drone)
                         stats = assignment.draw_stats(camera_data)
 
                         cv2.imshow ("Real camera", camera_data)
