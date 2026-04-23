@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 class MyAssignment:
     SEGMENT_LOCATION_GATES = [2, 4, 6, 8, 10]
-    INIT_POS = [1, 4, 0.5, np.deg2rad(45)]
+    INIT_POS = [1, 4, 1.35, np.deg2rad(45)]
     GOAL_TOL = 0.25
     
     MP_GRID_SIZE = 0.25
@@ -141,7 +141,6 @@ class MyAssignment:
         gates = self.detector.get_buffer(gates, dt)
         gates_positions = self.detector.compute_gates_position(gates, drone_rot, actual_pos[:3])
         idx_gate = self._get_idx_gate_search(gates_positions, self.idx_gate_search)
-        print ("IDX", idx_gate, "GPOS", len(gates_positions), "G", len(gates))
     
         if self.mode_searching == 0: 
             if len(gates) == 0 or idx_gate is None:
@@ -168,6 +167,7 @@ class MyAssignment:
                     self.pos_gates.append(gates_positions[idx_gate]["command"])
                     self.mode_searching.set(2)
                     self.idx_gate_search += 1
+                    self.idx_gate_search %= len(self.SEGMENT_LOCATION_GATES)
                     self.target_control_command = None
                     self._check_gate_pos(gates_positions[idx_gate]["command"])
 
@@ -282,7 +282,7 @@ class MyAssignment:
                     segment = self._get_actual_segment(p_gate[:3])
                     location_gates.append(segment)
 
-                if sorted(location_gates) == sorted(self.SEGMENT_LOCATION_GATES) and self.mode_trajectory == 0:
+                if sorted(location_gates) == sorted(self.SEGMENT_LOCATION_GATES) and self.mode_searching == 1:
                     # We have all the gates, we can run
                     self.mode.set()
 
@@ -439,6 +439,7 @@ class MyAssignment:
                     detected = True
             if not detected:
                 print ("> WARNING: Gate in segment", segment, "not detected.")
+                
 class GatesDetector:
 
     CAM_FIELD_OF_VIEW = 1.5
@@ -912,9 +913,9 @@ class MotionPlanner3D():
             self.plot_obstacle(ax, ob[0], ob[1], ob[2], ob[3], ob[4], ob[5])
 
         ax.plot(trajectory_setpoints[:,0], trajectory_setpoints[:,1], trajectory_setpoints[:,2], label="Minimum-Jerk Trajectory", linewidth=2)
-        ax.set_xlim(0, 5)
-        ax.set_ylim(0, 3)
-        ax.set_zlim(0, 1.5)
+        ax.set_xlim(0, 8)
+        ax.set_ylim(0, 8)
+        ax.set_zlim(0, 2.5)
 
         # Plot waypoints
         waypoints_x = [p[0] for p in path_waypoints]

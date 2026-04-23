@@ -30,6 +30,7 @@ setpoint_lock = threading.Lock()
 running = True
 
 np.random.seed(0)
+random.seed(0)
 
 # Crazyflie drone class in webots
 class CrazyflieInDroneDome(Supervisor):
