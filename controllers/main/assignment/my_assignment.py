@@ -7,6 +7,7 @@ from scipy.spatial.transform import Rotation as R
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
+from controllers.main.lib.mapping_and_planning_examples import trajectory_tracking
 from lib.a_star_3D import AStar3D
 
 # The available ground truth state measurements can be accessed by calling sensor_data[item]. All values of "item" are provided as defined in main.py within the function read_sensors.
@@ -704,11 +705,51 @@ class MotionPlanner3D():
 
         self.init_params(path_waypoints)
         poly_coeffs = self.compute_poly_coefficients(path_waypoints)
-        self.trajectory_setpoints, self.time_setpoints = self.poly_setpoint_extraction(poly_coeffs, self.obstacles, path_waypoints)
+        self.trajectory_setpoints, self.time_setpoints, _ = self.poly_setpoint_extraction(poly_coeffs, self.obstacles, path_waypoints)
 
         ## ---------------------------------------------------------------------------------------------------- ##
 
-    def init_params(self, path_waypoints):
+    def run_planner_opt (self, path_waypoints):
+
+        tol = 1e-2
+        learn_vel = 0.1
+        learn_acc = 0.1
+        t = 10
+        done = False
+
+        trajectory_setpoint, time_setpoint = None, None
+
+        while not done:
+            # Copmute trajectory
+            self.init_params(path_waypoints, t_final=t)
+            poly_coeffs = self.compute_poly_coefficients(path_waypoints)
+            traj_set, time_set, info = self.poly_setpoint_extraction(poly_coeffs, self.obstacles, path_waypoints)
+
+            result, msg = self.check_limits(info)
+            if result:
+                # Save good traj
+                trajectory_setpoint, time_setpoint = traj_set, time_set
+                
+                # Compute diff
+                vel_disponible = self.vel_lim - info["vel"]["max"]
+                acc_disponible = self.acc_lim - info["acc"]["max"]
+
+                # Compute new time
+                # new_time = max (t - vel_disponible * learn_vel, t - acc_disponible * learn_acc)
+                new_time = t - vel_disponible * learn_vel
+
+                # Check if we converge or we find a limit
+                if new_time < 0 or (abs(t - new_time) < tol):
+                    done = True 
+                else:
+                    t = new_time
+            else: 
+                done = True
+                print (msg)
+
+        self.trajectory_setpoints, self.time_setpoints = trajectory_setpoint, time_setpoint
+
+    def init_params(self, path_waypoints, t_final=None):
 
         # Inputs:
         # - path_waypoints: The sequence of input path waypoints provided by the path-planner, including the start and final goal position: Vector of m waypoints, consisting of a tuple with three reference positions each as provided by AStar
@@ -717,7 +758,7 @@ class MotionPlanner3D():
         self.disc_steps = 20 #Integer number steps to divide every path segment into to provide the reference positions for PID control # IDEAL: Between 10 and 20
         self.vel_lim = 7.0 #Velocity limit of the drone (m/s)
         self.acc_lim = 50.0 #Acceleration limit of the drone (m/s²)
-        t_f = self.final_time
+        t_f = self.final_time if t_final is None else t_final
 
         # Determine the number of segments of the path
         self.times = np.linspace(0, t_f, len(path_waypoints)) # The time vector at each path waypoint to traverse (Vector of size m) (must be 0 at start)
@@ -866,7 +907,8 @@ class MotionPlanner3D():
         yaw_vals = np.zeros((self.disc_steps*len(self.times),1))
         trajectory_setpoints = np.hstack((x_vals, y_vals, z_vals, yaw_vals))
 
-        self.plot(obs, path_waypoints, trajectory_setpoints)
+        if len(path_waypoints) > 3:
+            self.plot(obs, path_waypoints, trajectory_setpoints)
             
         # Find the maximum absolute velocity during the segment
         vel_max = np.max(np.sqrt(v_x_vals**2 + v_y_vals**2 + v_z_vals**2))
@@ -874,18 +916,27 @@ class MotionPlanner3D():
         acc_max = np.max(np.sqrt(a_x_vals**2 + a_y_vals**2 + a_z_vals**2))
         acc_mean = np.mean(np.sqrt(a_x_vals**2 + a_y_vals**2 + a_z_vals**2))
 
-        print("Maximum flight speed: " + str(vel_max))
-        print("Average flight speed: " + str(vel_mean))
-        print("Average flight acceleration: " + str(acc_mean))
-        print("Maximum flight acceleration: " + str(acc_max))
-        
-        # Check that it is less than an upper limit velocity v_lim
-        assert vel_max <= self.vel_lim, "The drone velocity exceeds the limit velocity : " + str(vel_max) + " m/s"
-        assert acc_max <= self.acc_lim, "The drone acceleration exceeds the limit acceleration : " + str(acc_max) + " m/s²"
-
+        info = {
+            "vel": {
+                "max": vel_max,
+                "mean": vel_mean
+            },
+            "acc": {
+                "max": acc_max,
+                "mean": acc_mean
+            }
+        }
         # ---------------------------------------------------------------------------------------------------- ##
 
-        return trajectory_setpoints, time_setpoints
+        return trajectory_setpoints, time_setpoints, info
+    
+    def check_limits (self, info) -> Tuple[bool, str]:
+        # Check that it is less than an upper limit velocity v_lim
+        if info["vel"]["max"] <= self.vel_lim:
+            return False, "The drone velocity exceeds the limit velocity : " + str(info["vel"]["max"]) + " m/s"
+        if info["acc"]["max"] <= self.acc_lim:
+            return False, "The drone acceleration exceeds the limit acceleration : " + str(info["acc"]["max"]) + " m/s²"
+        return True, ""
     
     def plot_obstacle(self, ax, x, y, z, dx, dy, dz, color='gray', alpha=0.3):
 
