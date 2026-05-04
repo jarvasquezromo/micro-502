@@ -1,13 +1,13 @@
 import cv2
 import numpy as np
-from typing import Tuple, List, Union, Dict
+from dataclasses import dataclass, field
+from typing import Tuple, List, Union, Dict, Optional
 
 from scipy.spatial.transform import Rotation as R
 
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from controllers.main.lib.mapping_and_planning_examples import trajectory_tracking
 from lib.a_star_3D import AStar3D
 
 # The available ground truth state measurements can be accessed by calling sensor_data[item]. All values of "item" are provided as defined in main.py within the function read_sensors.
@@ -55,7 +55,7 @@ class MyAssignment:
         # 1: computing trajectory from start and goal
         # 2: compute trajectory from waypoints
         # 3: running trajectory
-        self.mode_searching = Keeper(1)
+        self.mode_searching = Keeper()
         # 0: go to position of searching
         # 1: turn around to look for the gate
         # 2: go near the gate
@@ -75,20 +75,46 @@ class MyAssignment:
         self.mp = MotionPlanner3D()
 
         self.tracker = Tracker()
-        self.detector = GatesDetector()
+        self.detector = GatesDetectorTriangulation()
 
-        self.timer_searching = 0
         self.drone = None
+
+        # Gap-fill state (used by _detect_and_estimate_gates)
+        self._last_estimates = []
+        self._gap_timer = 0.0
+
+        # ── Triangulation / observation buffer ───────────────────────────
+        # Accumulated (corners, R, T) tuples while the drone sweeps step 2.
+        self._obs_buffer: List[tuple] = []
+        self._obs_buffer_refined: List[tuple] = []
+        # Minimum baseline between consecutive stored observations (metres).
+        self._TRI_MIN_BASELINE: float = 0.10
+        self._reset_search_state()
+ 
+        # Gap-fill state
+        self._last_estimates: List = []
+        self._gap_timer: float = 0.0
+
 
     def run_motion_planing (self, start, goal, obstacles):
         self.mp.run_motion_planner(start, obstacles, self.MP_BOUNDS, self.MP_GRID_SIZE, goal)
+        self.tracker.reset()
 
-    def run_planner (self, trajectories, erase_obstacles=False):
+
+    def run_planner (self, trajectories, erase_obstacles=False, **kwargs):
         if erase_obstacles: self.mp.obstacles = []
         
         # Compute trajectory
-        self.mp.run_planner(trajectories)
-        self.trajectory_setpoints, self.time_setpoints = self.mp.trajectory_setpoints, self.mp.time_setpoints
+        self.mp.run_planner(trajectories, **kwargs)
+        # self.trajectory_setpoints, self.time_setpoints, self.critic_setpoints = \
+        #     self.mp.trajectory_setpoints, self.mp.time_setpoints, self.mp.critic_setpoint
+
+        self.tracker.reset()
+        self.tracker.load(
+            self.mp.time_setpoints, self.mp.trajectory_setpoints,
+            self.mp.velocity_setpoints, self.mp.acceleration_setpoints
+        )
+
 
     def compute_command(self, sensor_data, camera_data, dt):
 
@@ -114,7 +140,7 @@ class MyAssignment:
 
             # Updateing mode
             # print (control_command)
-            if len(control_command) != 4:
+            if len(control_command) != 4 and len(control_command) != 10:
                 logger.warning("Your control its bad: %s", str(control_command))
             pos = np.array([sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']])
             actual_segment = self._get_actual_segment(pos[:3])
@@ -125,90 +151,303 @@ class MyAssignment:
         self.last_command = control_command
         return control_command # Ordered as array with: [pos_x_cmd, pos_y_cmd, pos_z_cmd, yaw_cmd] in meters and radians
     
-    def search_gates (self, sensor_data, camera_data, dt):
-        # Default values
-        actual_pos = np.array([
-            sensor_data['x_global'], sensor_data['y_global'], 
-            sensor_data['z_global'], sensor_data['yaw']]
+    # ------------------------------------------------------------------ #
+    #  Detection helpers                                                   #
+    # ------------------------------------------------------------------ #
+ 
+    def _detect_gates_raw(self, camera_data, drone_rot, drone_pos):
+        """Run pink-mask detection and return (corners_list, estimates_list).
+        Always returns fresh detections — no gap-fill here."""
+        _, corners_list = self.detector._detect_pink_gates(camera_data)
+        estimates = self.detector.mono_gate_positions(corners_list, drone_rot, drone_pos) \
+                    if corners_list else []
+        return corners_list, estimates
+ 
+    def _accumulate_observation(self, corners, drone_rot, drone_pos, obs_buffer):
+        """Store one camera observation if the drone has moved enough since the last one."""
+        if not obs_buffer:
+            obs_buffer.append((corners, drone_rot, drone_pos.copy()))
+            return
+        last_T = obs_buffer[-1][2]
+        if np.linalg.norm(drone_pos - last_T) >= self._TRI_MIN_BASELINE:
+            obs_buffer.append((corners, drone_rot, drone_pos.copy()))
+ 
+    def _compute_best_gate_estimate(self, drone_pos, obs_buffer):
+        """
+        Triangulate across ALL pairs in _obs_buffer and return the median
+        centre estimate as a (4,) command [x,y,z,yaw].  Falls back to the
+        last mono estimate stored in _mono_gate_cmd if the buffer is too small.
+        """ 
+        if len(obs_buffer) < 2:
+            logger.warning("Not enough observations for triangulation, using mono fallback")
+            return self._mono_gate_cmd  # may be None
+ 
+        centres = []
+        yaws    = []
+        for i in range(len(obs_buffer) - 1):
+            c1, r1, t1 = obs_buffer[i]
+            c2, r2, t2 = obs_buffer[i + 1]
+            obs1 = CameraObservation(gate_corners=c1, R_drone_to_world=r1, T_drone_to_world=t1)
+            obs2 = CameraObservation(gate_corners=c2, R_drone_to_world=r2, T_drone_to_world=t2)
+            results = self.detector._triangulate_pair(obs1, obs2)
+            for est in results:
+                if est.residual is not None and est.residual < 0.35:
+                    centres.append(est.center)
+                    yaws.append(est.yaw)
+ 
+        if not centres:
+            logger.warning("All triangulation pairs had large residuals, using mono fallback")
+            return self._mono_gate_cmd
+ 
+        # Median over all valid triangulation results for robustness
+        centre = np.median(centres, axis=0)
+        yaw    = float(np.median(yaws))
+        logger.info(
+            "Triangulated gate from %d pairs → centre=%s  yaw=%.2f rad",
+            len(centres), np.round(centre, 3), yaw
         )
+        return np.concatenate([centre, [yaw]])
+ 
+    def _gate_estimate_to_command(self, estimate) -> dict:
+        """Adapt a GateEstimate to the dict format _get_idx_gate_search expects."""
+        return {"command": estimate.command, "valid": estimate.valid}
+ 
+    def _reset_search_state(self):
+        """Clear per-gate transient state before starting the next gate search."""
+        self._obs_buffer.clear()
+        self._obs_buffer_refined.clear()
+        self._sweep_waypoints = []
+        self._sweep_idx       = 0
+        self._mono_gate_cmd   = None
+        self.timer_searching  = 0.0
+        self.num_turns        = 0
+        self._sweep_direction = 1
+        self._sweep_pass      = 0
+
+ 
+    # ------------------------------------------------------------------ #
+    #  Main search state machine                                           #
+    # ------------------------------------------------------------------ #
+ 
+    def search_gates(self, sensor_data, camera_data, dt):
+        """
+        Trajectory-based gate search state machine.
+ 
+        Step 0  – Fly to pos_1 = _get_point_segment(gate_seg - 1, 3).
+                  Kick off a trajectory and wait for it to finish.
+ 
+        Step 1  – Launch a trajectory from pos_1 → pos_2 =
+                  _get_point_segment(gate_seg - 1, 0.5), collecting corners
+                  into _obs_buffer while the tracker runs.
+                  Detection happens every tick while mode_trajectory == 3.
+ 
+        Step 1½ – If after the pass we have fewer than MIN_CORNER_INSTANCES
+                  corner observations, reverse the trajectory (pos_2 → pos_1 or
+                  pos_1 → pos_2 depending on direction) and repeat until we
+                  collect enough data.
+ 
+        Step 2  – Launch a refined confirmation trajectory:
+                    actual_pos → pos_1 → point 0.6 m in front of the gate.
+                  Collect corners into _obs_buffer_refined along the way.
+ 
+        Step 3  – Compute the best gate estimate from _obs_buffer_refined
+                  (falls back to _obs_buffer if refined is sparse).
+                  Save gate position.
+ 
+        Step 4  – Pass through the gate: trajectory from actual_pos through
+                  gate centre to 0.5 m beyond.  Reset and move to next gate.
+        """
+        # ── Minimum number of corner detections before we trust the sweep ──
+        MIN_CORNER_INSTANCES = 4
+ 
+        actual_pos = np.array([
+            sensor_data['x_global'], sensor_data['y_global'],
+            sensor_data['z_global'], sensor_data['yaw'],
+        ])
         drone_rot = R.from_euler(
-            'xyz', 
+            'xyz',
             [sensor_data['roll'], sensor_data['pitch'], sensor_data['yaw']]
         )
         control_command = actual_pos.copy()
-
-        # Detect gates
-        _, gates = self.detector.pink_mask(camera_data)
-        gates = self.detector.get_buffer(gates, dt)
-        gates_positions = self.detector.compute_gates_position(gates, drone_rot, actual_pos[:3])
+ 
+        # ── Pre-compute the two sweep endpoints for this gate ────────────
+        gate_seg = self.SEGMENT_LOCATION_GATES[self.idx_gate_search]
+        pos_far = self._get_point_segment(gate_seg - 1, 3)   # far boundary
+        pos_near = self._get_point_segment(gate_seg - 1, 0.5) # near boundary
+ 
+        # ── Shared detection — runs every tick in steps 1, 1½, and 2 ────
+        corners_list, estimates = self._detect_gates_raw(
+            camera_data, drone_rot, actual_pos[:3]
+        )
+        gates_positions = [self._gate_estimate_to_command(e) for e in estimates]
         idx_gate = self._get_idx_gate_search(gates_positions, self.idx_gate_search)
-    
-        if self.mode_searching == 0: 
-            if len(gates) == 0 or idx_gate is None:
-                if self.target_control_command is None:
-                    self.mode_searching.set(1)
-                else:
-                    control_command = self.target_control_command
-            else:
-                # We have the gate position
-                control_command = self._compute_space_to_pos(gates_positions[idx_gate]["command"], -0.4)
-                control_command[2] = np.clip(control_command[2], 0.9, 1.8)
-                self.target_control_command = control_command
-                self.mode_searching.set (3) # Wait a litlle bit
-
-            # If we get the target pos
-            if self.target_control_command is not None \
-                and self._achieve_goal(actual_pos, self.target_control_command):
-                # If we dont see the gate, look again
-                if idx_gate is None or (not gates_positions[idx_gate]["valid"]):
-                    self.target_control_command = None
-                    self.mode_searching.set(1)
-                else:
-                    logger.debug ("saving gate")
-                    self.pos_gates.append(gates_positions[idx_gate]["command"])
-                    self.mode_searching.set(2)
-                    self.idx_gate_search += 1
-                    self.idx_gate_search %= len(self.SEGMENT_LOCATION_GATES)
-                    self.target_control_command = None
-                    self._check_gate_pos(gates_positions[idx_gate]["command"])
-
-        elif self.mode_searching == 1: # Keep rotating
-            # Go to the segment before of the gate and rotate.
-            midle_pos = self._get_midle_point_segment(
-                self.SEGMENT_LOCATION_GATES[self.idx_gate_search] - 1)
+ 
+        # ================================================================
+        if self.mode_searching == 0:
+            # ── Step 0: fly to pos_1 ─────────────────────
+            control_command = pos_far.copy()
+ 
+            # Transition once the tracker signals completion
+            if self._achieve_goal(actual_pos, pos_far):
+                logger.debug("Step 0 done — arrived at pos_far, starting sweep")
+                self._reset_search_state()
+                # Launch step-1 trajectory immediately
+                trajectory = [actual_pos[:3], np.mean((actual_pos[:3], pos_near[:3]), axis=0), pos_near[:3]]
+                self.run_planner(trajectory, t_final=5)
+                self.mode_searching.set(1)
+ 
+        # ================================================================
+        elif self.mode_searching == 1:
+            # ── Step 1: sweep pos_1 → pos_2, accumulate corners ─────────
+            # Accumulate detections while the tracker is running
+            control_command, done = self.tracker.trajectory_tracking (
+                sensor_data, dt, self.GOAL_TOL)
+            control_command[3] = sensor_data['yaw']
             
-            # Review only the position, not the yaw
-            if self._achieve_goal(actual_pos[:3], midle_pos[:3]):
-                if len(gates) > 0 and idx_gate is not None:
-                    self.mode_searching.set(0)
-                else:
-                    control_command[3] += np.deg2rad(15)
-            else:
-                control_command = midle_pos
+            if not done:
+                if idx_gate is not None and corners_list:
+                    self._accumulate_observation(
+                        corners_list[idx_gate], drone_rot, actual_pos[:3], self._obs_buffer
+                    )
+                    if estimates[idx_gate].valid:
+                        self._mono_gate_cmd = gates_positions[idx_gate]["command"].copy()
 
-        elif self.mode_searching == 2: # Pass thorogh gate and a little bit more
+                    if self._mono_gate_cmd is not None:
+                        dir_to_gate = self._mono_gate_cmd[:2] - actual_pos[:2]
+                        control_command[3] = np.arctan2(dir_to_gate[1], dir_to_gate[0])
+            else: 
+                # Trajectory finished → check data quality
+                n_obs = len(self._obs_buffer)
+                logger.debug(
+                    "Step 1 pass %d done — %d corner observations collected",
+                    self._sweep_pass, n_obs,
+                )
+                self._sweep_pass += 1
+
+                if n_obs >= MIN_CORNER_INSTANCES:
+                    # Enough data — proceed to confirmation sweep
+                    logger.debug("Step 1 sufficient data, moving to Step 2")
+                    gate_cmd = self._compute_best_gate_estimate(actual_pos[:3], self._obs_buffer)
+                    pos_middle = self._get_point_segment(gate_seg - 1, 1.5)
+                    trajectory = [
+                        actual_pos[:3], 
+                        pos_middle,
+                        self._compute_space_to_pos(gate_cmd, -0.5)
+                    ]
+                    self.run_planner(trajectory, t_final=5)
+                    self.mode_searching.set(2)
+                else:
+                    # ── Step 1½: not enough data — reverse and retry ─────
+                    logger.debug(
+                        "Step 1½ — only %d observations, reversing sweep (pass %d)",
+                        n_obs, self._sweep_pass,
+                    )
+                    # Alternate direction: if we just went pos_1→pos_2 go back,
+                    # and vice-versa, so the drone keeps scanning the same region.
+                    if self._sweep_direction == 1:
+                        trajectory = [
+                            actual_pos[:3], 
+                            np.mean((actual_pos[:3], pos_far[:3]), axis=0), 
+                            pos_far[:3]
+                        ]
+                        self.run_planner(trajectory, t_final=5)
+                        self._sweep_direction = -1
+                    else:
+                        trajectory = [
+                            actual_pos[:3], 
+                            np.mean((actual_pos[:3], pos_near[:3]), axis=0), 
+                            pos_near[:3]
+                        ]
+                        self.run_planner(trajectory, t_final=5)
+                        self._sweep_direction = 1
+ 
+        # ================================================================
+        elif self.mode_searching == 2:
+            # ── Step 2: confirmation trajectory, accumulate refined data ─
+            # actual_pos → pos_1 → 0.6 m in front of rough gate estimate
+            control_command, done = self.tracker.trajectory_tracking (
+                sensor_data, dt, self.GOAL_TOL)
+            control_command[3] = sensor_data['yaw']
+            end_trajectory = self._achieve_goal(actual_pos, self.tracker.setpoints[-1])
+
+            looking = False
+            if self._mono_gate_cmd is not None:
+                dir_to_gate = self._mono_gate_cmd[:2] - actual_pos[:2]
+                control_command[3] = np.arctan2(dir_to_gate[1], dir_to_gate[0])
+                
+                if self._achieve_goal(control_command[3], actual_pos[3], tol=0.1):
+                    looking = True
+            
+            if idx_gate is not None and corners_list:
+                self._accumulate_observation(
+                    corners_list[idx_gate], drone_rot, actual_pos[:3], self._obs_buffer_refined
+                )
+                if estimates[idx_gate].valid:
+                    self._mono_gate_cmd = gates_positions[idx_gate]["command"].copy()
+
+            if (done or end_trajectory) and looking:
+                control_command = actual_pos.copy()
+                logger.debug(
+                    "Step 2 done — %d refined observations collected",
+                    len(self._obs_buffer_refined),
+                )
+                self.mode_searching.set(3)
+ 
+        # ================================================================
+        elif self.mode_searching == 3:
+            # ── Step 3: compute best estimate from refined (or raw) data ─
+            gate_cmd = self._compute_best_gate_estimate(
+                actual_pos[:3], self._obs_buffer_refined
+            )
+            if gate_cmd is None:
+                # Fall back to the coarser buffer from step 1
+                logger.warning(
+                    "Step 3 refined estimation failed, falling back to raw buffer"
+                )
+                gate_cmd = self._compute_best_gate_estimate(actual_pos[:3], self._obs_buffer)
+ 
+            if gate_cmd is None:
+                logger.warning("Gate estimation failed entirely, retrying from Step 1")
+                self._reset_search_state()
+                self.mode_searching.set(0)
+            else:
+                self.pos_gates.append(gate_cmd)
+                self._check_gate_pos(gate_cmd)
+                logger.info(
+                    "Gate %d saved at %s", self.idx_gate_search, np.round(gate_cmd, 3)
+                )
+                self.mode_searching.set(4)
+ 
+            control_command = actual_pos.copy()   # hover while computing
+ 
+        # ================================================================
+        elif self.mode_searching == 4:
+            # ── Step 4: pass through the gate ───────────────────────────
+            gate_cmd   = self.pos_gates[-1]
+            beyond_pos = self._compute_space_to_pos(gate_cmd, 0.5)
+ 
             self.trajectory = [
                 actual_pos[:3],
-                self.pos_gates[-1],
-                self._compute_space_to_pos(self.pos_gates[-1], 0.5)
+                gate_cmd[:3],
+                beyond_pos[:3],
             ]
             self.mode_trajectory.set(2)
+ 
+            # Advance gate index and reset for next gate
+            self.idx_gate_search += 1
+            self.idx_gate_search %= len(self.SEGMENT_LOCATION_GATES)
+            self._reset_search_state()
             self.mode_searching.set(0)
-
-        elif self.mode_searching == 3: # Wait a time until come back again
-            self.timer_searching += dt
-
-            if self.timer_searching > 2:
-                self.timer_searching = 0
-                self.mode_searching.set(0)
-
-            control_command = self.target_control_command
+ 
+            control_command = actual_pos.copy()   # trajectory takes over next tick
+ 
         else:
-            raise ValueError (f"Wrong value of searching mode ({self.mode_searching})")
-        
+            raise ValueError(f"Unknown mode_searching value: {self.mode_searching}")
+ 
         return control_command
 
     def fast_mode (self, sensor_data, camera_data):
+        # TODO: do trayectory and look for the gates, ensure passing through
         # Default values
         actual_pos = np.array([
             sensor_data['x_global'], sensor_data['y_global'], 
@@ -247,7 +486,6 @@ class MyAssignment:
         if self.mode_trajectory == 1:
             # Compute trajectory
             self.run_motion_planing(self.start, self.goal, self.obstacles)
-            self.tracker.reset()
 
             # Change mode
             self.mode_trajectory.set(3)
@@ -255,14 +493,13 @@ class MyAssignment:
         elif self.mode_trajectory == 2:
             # Compute trajectory form waypoints
             self.run_planner(self.trajectory, True)
-            self.tracker.reset()
 
             # Change mode
             self.mode_trajectory.set(3)
             return control_command
         elif self.mode_trajectory == 3:
             control_command, done = self.tracker.trajectory_tracking (
-                sensor_data, dt, self.time_setpoints, self.trajectory_setpoints, self.GOAL_TOL)
+                sensor_data, dt, self.GOAL_TOL)
             control_command[3] = sensor_data['yaw']
             
             if done and not self.tracker.repeat: 
@@ -283,7 +520,8 @@ class MyAssignment:
                     segment = self._get_actual_segment(p_gate[:3])
                     location_gates.append(segment)
 
-                if sorted(location_gates) == sorted(self.SEGMENT_LOCATION_GATES) and self.mode_searching == 1:
+                if (sorted(location_gates) == sorted(self.SEGMENT_LOCATION_GATES) 
+                    and self.mode_searching == self.mode_searching.default):
                     # We have all the gates, we can run
                     self.mode.set()
 
@@ -376,12 +614,12 @@ class MyAssignment:
             return True
         return False
 
-    def _get_midle_point_segment (self, segment):
+    def _get_point_segment (self, segment, radius=3):
         # Get position in theta
         obj_theta = segment * np.deg2rad(30) - np.deg2rad(90)
 
         # Get in global pos
-        global_pos = self._cilindrical_to_coord(3, obj_theta, 1.35)
+        global_pos = self._cilindrical_to_coord(radius, obj_theta, 1.35)
 
         return np.concatenate([global_pos, [obj_theta + np.deg2rad(0)]])
 
@@ -431,15 +669,16 @@ class MyAssignment:
             print ("\nGATES POSITIONS")
 
             detected = False
+            segment_gate = self._get_actual_segment(gate_pos[:3])
             for real in self.drone.gate_positions:
                 segment = self._get_actual_segment(real)
-                if np.linalg.norm (real - gate_pos[:3]) < 0.1:
+                if np.linalg.norm (real - gate_pos[:3]) < 0.25:
                     print (f"> Gate detected correctly! Segment ({segment})")
                     print ("    > Real:", real)
                     print ("    > Estimated:", gate_pos)
                     detected = True
             if not detected:
-                print ("> WARNING: Gate in segment", segment, "not detected.")
+                print ("> WARNING: Gate in segment", segment_gate, "not detected.")
                 
 class GatesDetector:
 
@@ -627,6 +866,445 @@ class GatesDetector:
                 return False
         return True
 
+@dataclass
+class CameraObservation:
+    """Stores one camera frame observation of gate corners together with the drone pose."""
+    gate_corners: np.ndarray          # shape (4, 2) – ordered [TL, TR, BR, BL]
+    R_drone_to_world: R               # drone orientation in world frame
+    T_drone_to_world: np.ndarray      # drone position  in world frame (3,)
+
+
+@dataclass
+class GateEstimate:
+    """Full gate estimate produced by triangulation (or fallback mono estimate)."""
+    center: np.ndarray                # (3,) world-frame XYZ
+    yaw: float                        # radians
+    valid: bool
+    method: str                       # "triangulation" | "mono"
+    residual: Optional[float] = None  # distance |FG| – quality indicator (triangulation only)
+
+    @property
+    def command(self) -> np.ndarray:
+        return np.concatenate([self.center, [self.yaw]])
+
+
+class GatesDetectorTriangulation:
+    """
+    Gate detector that uses two-view triangulation (VIO appendix method) to estimate
+    the 3-D position of racing-gate corners.
+
+    Workflow
+    --------
+    1. Call ``load_observation(camera_data, R_drone, T_drone)`` each time a new
+       camera frame arrives (with its associated drone pose).
+    2. After at least two observations have been loaded, call
+       ``compute_gate_positions()`` to get triangulated estimates.
+    3. Alternatively, call the single-frame helper ``mono_gate_positions()`` to
+       fall back to the height-based monocular estimate from the original class.
+
+    Camera constants are identical to GatesDetector so both classes are
+    interchangeable.
+    """
+
+    # ------------------------------------------------------------------ #
+    #  Camera / gate constants (mirror GatesDetector)                     #
+    # ------------------------------------------------------------------ #
+    CAM_FIELD_OF_VIEW: float = 1.5          # rad
+    CAM_WIDTH:  int = 300                   # px
+    CAM_HEIGHT: int = 300                   # px
+
+    CAM_FOCAL_DIST: float = CAM_WIDTH / (2 * np.tan(CAM_FIELD_OF_VIEW / 2))
+
+    # Camera offset relative to the drone body frame
+    CAM_POS_REL: np.ndarray = np.array([0.03, 0.0, 0.01])
+    # Rotation: body → camera  (zcam = xdrone, xcam = -ydrone, ycam = -zdrone)
+    CAM_ROT_REL: R = R.from_euler('xz', [-np.deg2rad(90), -np.deg2rad(90)])
+
+    GATE_HEIGHT: float = 0.4            # m – vertical post height
+    GATE_WIDTH:  float = 0.6            # m – horizontal width (for validity check)
+
+    # Buffer: keep the last N observations per detected gate
+    MAX_OBS_BUFFER: int = 10
+
+    # ------------------------------------------------------------------ #
+    #  Constructor                                                         #
+    # ------------------------------------------------------------------ #
+    def __init__(self) -> None:
+        self.k = np.array([
+            [self.CAM_FOCAL_DIST, 0,                   self.CAM_WIDTH  / 2],
+            [0,                   self.CAM_FOCAL_DIST,  self.CAM_HEIGHT / 2],
+            [0,                   0,                   1],
+        ])
+        self.inv_k = np.linalg.inv(self.k)
+
+        # Ring-buffer of observations (one list per tracked gate slot)
+        # For simplicity we keep a single observation queue; you can extend
+        # this to multi-gate tracking with a gate-association step.
+        self._observations: List[CameraObservation] = []
+
+        # Last valid estimate for temporal smoothing / gap-filling
+        self._last_estimates: Optional[List[GateEstimate]] = None
+        self._gap_timer: float = 0.0
+        self.GAP_FILL_DURATION: float = 0.5   # seconds
+
+        self.last_mask: Optional[np.ndarray] = None
+
+    # ------------------------------------------------------------------ #
+    #  Public API                                                          #
+    # ------------------------------------------------------------------ #
+
+    def load_observation(
+        self,
+        camera_data: np.ndarray,
+        R_drone_to_world: R,
+        T_drone_to_world: np.ndarray,
+    ) -> Tuple[np.ndarray, List[np.ndarray]]:
+        """
+        Detect gates in *camera_data*, store the observation, and return the
+        annotated image together with the raw list of corner arrays.
+
+        Parameters
+        ----------
+        camera_data      : RGB image (H × W × 3).
+        R_drone_to_world : Current drone orientation.
+        T_drone_to_world : Current drone position in world frame (3,).
+
+        Returns
+        -------
+        annotated_img  : Image with drawn corners.
+        gates_corners  : List of (4,2) corner arrays for each detected gate.
+        """
+        annotated_img, gates_corners = self._detect_pink_gates(camera_data)
+
+        for gate_corners in gates_corners:
+            obs = CameraObservation(
+                gate_corners=gate_corners,
+                R_drone_to_world=R_drone_to_world,
+                T_drone_to_world=T_drone_to_world.copy(),
+            )
+            self._observations.append(obs)
+
+        # Keep buffer bounded
+        if len(self._observations) > self.MAX_OBS_BUFFER:
+            self._observations = self._observations[-self.MAX_OBS_BUFFER:]
+
+        return annotated_img, gates_corners
+
+    def compute_gate_positions(
+        self,
+        R_drone_to_world: Optional[R] = None,
+        T_drone_to_world: Optional[np.ndarray] = None,
+    ) -> List[GateEstimate]:
+        """
+        Compute gate positions using triangulation from the two most recent
+        observations.  Falls back to mono estimate if only one observation is
+        available (requires current pose arguments in that case).
+
+        Returns a list of GateEstimate objects (one per gate detected in the
+        latest observation).
+        """
+        if len(self._observations) < 2:
+            if R_drone_to_world is not None and T_drone_to_world is not None:
+                return self._mono_from_last_obs(R_drone_to_world, T_drone_to_world)
+            return []
+
+        obs1 = self._observations[-2]
+        obs2 = self._observations[-1]
+        return self._triangulate_pair(obs1, obs2)
+
+    def mono_gate_positions(
+        self,
+        gates_corners: List[np.ndarray],
+        R_drone_to_world: R,
+        T_drone_to_world: np.ndarray,
+    ) -> List[GateEstimate]:
+        """
+        Original height-based monocular position estimate (kept as fallback).
+        Mirrors ``compute_gates_position`` from GatesDetector but returns
+        GateEstimate objects.
+        """
+        estimates = []
+        for gate in gates_corners:
+            left_pos  = self._get_rel_center_pos(gate[0], gate[3], self.GATE_HEIGHT)
+            right_pos = self._get_rel_center_pos(gate[1], gate[2], self.GATE_HEIGHT)
+
+            gate_pos_left  = self._cam_to_world(left_pos,  R_drone_to_world, T_drone_to_world)
+            gate_pos_right = self._cam_to_world(right_pos, R_drone_to_world, T_drone_to_world)
+
+            valid = (
+                np.linalg.norm(gate_pos_left - gate_pos_right) > 0.29
+                and self._gate_on_frame_limits(gate)
+            )
+
+            center, yaw = self._center_and_yaw(gate_pos_left, gate_pos_right, T_drone_to_world)
+            estimates.append(GateEstimate(center=center, yaw=yaw, valid=valid, method="mono"))
+
+        return estimates
+
+    def get_buffered_estimates(
+        self,
+        estimates: List[GateEstimate],
+        dt: float,
+    ) -> List[GateEstimate]:
+        """Temporal gap-filler: return last valid estimate for up to GAP_FILL_DURATION seconds."""
+        self._gap_timer += dt
+        if (
+            len(estimates) == 0
+            and self._gap_timer < self.GAP_FILL_DURATION
+            and self._last_estimates
+        ):
+            return self._last_estimates
+
+        self._last_estimates = estimates
+        self._gap_timer = 0.0
+        return estimates
+
+    # ------------------------------------------------------------------ #
+    #  Triangulation core (appendix method)                               #
+    # ------------------------------------------------------------------ #
+
+    def _triangulate_pair(
+        self, obs1: CameraObservation, obs2: CameraObservation
+    ) -> List[GateEstimate]:
+        """
+        Triangulate ALL four gate corners using the two-line midpoint method
+        described in the VIO appendix.
+
+        For each corner pair (left column from obs1, left column from obs2, etc.)
+        we triangulate independently, then average to get the gate centre.
+        """
+        estimates = []
+
+        # We associate obs1 and obs2 as two views of the same gate.
+        # Corner indices: 0=TL, 1=TR, 2=BR, 3=BL
+        # Left post: corners 0 (top) and 3 (bottom)
+        # Right post: corners 1 (top) and 2 (bottom)
+
+        for corner_top_idx, corner_bot_idx, label in [
+            (0, 3, "left"),
+            (1, 2, "right"),
+        ]:
+            # --- Camera positions in world frame ---
+            P = self._camera_world_pos(obs1.R_drone_to_world, obs1.T_drone_to_world)
+            Q = self._camera_world_pos(obs2.R_drone_to_world, obs2.T_drone_to_world)
+
+            # --- Bearing vectors in world frame ---
+            # For each observation we use the *midpoint* pixel of the post
+            mid1 = (obs1.gate_corners[corner_top_idx] + obs1.gate_corners[corner_bot_idx]) / 2
+            mid2 = (obs2.gate_corners[corner_top_idx] + obs2.gate_corners[corner_bot_idx]) / 2
+
+            r = self._pixel_to_world_ray(mid1, obs1.R_drone_to_world)
+            s = self._pixel_to_world_ray(mid2, obs2.R_drone_to_world)
+
+            # --- Solve for λ, μ via pseudo-inverse (appendix eq. 9) ---
+            A = np.column_stack([r, -s])            # 3×2
+            b = Q - P
+            lm, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+            lam, mu = lm
+
+            F = P + lam * r                          # point on ray 1
+            G = Q + mu  * s                          # point on ray 2
+
+            midpoint = (F + G) / 2                   # triangulated 3-D point (appendix eq. 8)
+            residual = float(np.linalg.norm(F - G))  # quality indicator
+
+            if label == "left":
+                left_3d  = midpoint
+                left_res = residual
+            else:
+                right_3d  = midpoint
+                right_res = residual
+
+        # Gate validity: width and frame limits
+        width = np.linalg.norm(left_3d - right_3d)
+        valid = (
+            width > 0.29
+            and self._gate_on_frame_limits(obs2.gate_corners)
+        )
+
+        center, yaw = self._center_and_yaw(left_3d, right_3d, obs2.T_drone_to_world)
+        avg_residual = (left_res + right_res) / 2
+
+        estimates.append(GateEstimate(
+            center=center,
+            yaw=yaw,
+            valid=valid,
+            method="triangulation",
+            residual=avg_residual,
+        ))
+        return estimates
+
+    def triangulate_pixel_pair(
+        self,
+        pixel1: np.ndarray,
+        R1: R,
+        T1: np.ndarray,
+        pixel2: np.ndarray,
+        R2: R,
+        T2: np.ndarray,
+    ) -> Tuple[np.ndarray, float]:
+        """
+        Low-level helper: triangulate a single pixel seen in two frames.
+
+        Parameters
+        ----------
+        pixel1, pixel2 : (2,) pixel coordinates in each image.
+        R1, T1         : Drone pose for frame 1.
+        R2, T2         : Drone pose for frame 2.
+
+        Returns
+        -------
+        point_3d  : (3,) triangulated world-frame point.
+        residual  : |FG| – distance between the two closest points on rays.
+        """
+        P = self._camera_world_pos(R1, T1)
+        Q = self._camera_world_pos(R2, T2)
+
+        r = self._pixel_to_world_ray(pixel1, R1)
+        s = self._pixel_to_world_ray(pixel2, R2)
+
+        A = np.column_stack([r, -s])
+        b = Q - P
+        lm, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        lam, mu = lm
+
+        F = P + lam * r
+        G = Q + mu  * s
+        return (F + G) / 2, float(np.linalg.norm(F - G))
+
+    # ------------------------------------------------------------------ #
+    #  Geometry helpers                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _camera_world_pos(self, R_drone_to_world: R, T_drone_to_world: np.ndarray) -> np.ndarray:
+        """Compute the camera optical-centre position in world frame."""
+        return R_drone_to_world.apply(self.CAM_ROT_REL.apply(np.zeros(3)) + self.CAM_POS_REL) + T_drone_to_world
+
+    def _pixel_to_world_ray(self, pixel: np.ndarray, R_drone_to_world: R) -> np.ndarray:
+        """
+        Convert a pixel coordinate to a unit bearing vector in world frame.
+
+        Steps (appendix §1):
+          1. Unproject pixel through K⁻¹ → direction in camera frame.
+          2. Rotate camera → drone body (CAM_ROT_REL).
+          3. Rotate drone body → world (R_drone_to_world).
+        """
+        px_h = np.array([pixel[0], pixel[1], 1.0])
+        v_cam = self.inv_k @ px_h                              # direction in camera frame
+        v_body = self.CAM_ROT_REL.apply(v_cam)                # camera → body
+        v_world = R_drone_to_world.apply(v_body)               # body → world
+        return v_world / np.linalg.norm(v_world)               # unit vector
+
+    def _cam_to_world(
+        self,
+        p_cam: np.ndarray,
+        R_drone_to_world: R,
+        T_drone_to_world: np.ndarray,
+    ) -> np.ndarray:
+        """Transform a point from camera frame to world frame."""
+        p_body = self.CAM_ROT_REL.apply(p_cam) + self.CAM_POS_REL
+        return R_drone_to_world.apply(p_body) + T_drone_to_world
+
+    def _get_rel_center_pos(
+        self,
+        pos_pixel_top: np.ndarray,
+        pos_pixel_bottom: np.ndarray,
+        real_dist: float,
+    ) -> np.ndarray:
+        """Monocular depth estimate from known object height (original method)."""
+        dist_px = np.linalg.norm(pos_pixel_top - pos_pixel_bottom)
+        depth   = real_dist * self.CAM_FOCAL_DIST / max(dist_px, 1e-6)
+
+        mid_px = (pos_pixel_top + pos_pixel_bottom) / 2
+        ray    = self.inv_k @ np.array([mid_px[0], mid_px[1], 1.0])
+        p_z    = depth / np.linalg.norm(ray)
+        return np.array([ray[0] * p_z, ray[1] * p_z, p_z])
+
+    @staticmethod
+    def _center_and_yaw(
+        left_3d: np.ndarray,
+        right_3d: np.ndarray,
+        drone_pos: np.ndarray,
+    ) -> Tuple[np.ndarray, float]:
+        """Compute gate centre and yaw from left/right post positions."""
+        center  = (left_3d + right_3d) / 2
+        lateral = right_3d - left_3d
+        normal  = np.array([-lateral[1], lateral[0], 0.0])
+        if np.dot(normal, center - drone_pos) < 0:
+            normal = -normal
+        yaw = float(np.arctan2(normal[1], normal[0]))
+        return center, yaw
+
+    # ------------------------------------------------------------------ #
+    #  Detection helpers (mirror GatesDetector)                           #
+    # ------------------------------------------------------------------ #
+
+    def _detect_pink_gates(
+        self, camera_data: np.ndarray
+    ) -> Tuple[np.ndarray, List[np.ndarray]]:
+        img = camera_data.copy()
+        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+        mask = cv2.inRange(hsv, np.array([140, 50, 80], np.uint8),
+                                np.array([170, 255, 255], np.uint8))
+        annotated, gates = self._find_boxes(mask, img)
+        self.last_mask = annotated
+        return annotated, gates
+
+    def _find_boxes(
+        self, mask: np.ndarray, img: np.ndarray
+    ) -> Tuple[np.ndarray, List[np.ndarray]]:
+        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        gates = []
+        for cnt in contours:
+            if cv2.contourArea(cnt) < 50:
+                continue
+            eps    = 0.02 * cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, eps, True)
+            if len(approx) != 4:
+                continue
+
+            corners = approx.reshape(4, 2)
+            s    = corners.sum(axis=1)
+            diff = np.diff(corners, axis=1).flatten()
+            ordered = np.array([
+                corners[np.argmin(s)],      # TL
+                corners[np.argmin(diff)],   # TR
+                corners[np.argmax(s)],      # BR
+                corners[np.argmax(diff)],   # BL
+            ])
+            gates.append(ordered)
+            for pt in ordered:
+                cv2.circle(img, tuple(pt), 4, (255, 0, 0), -1)
+        return img, gates
+
+    def _gate_on_frame_limits(self, gate: np.ndarray, limit: int = 5) -> bool:
+        for corner in gate:
+            if (corner[0] < limit or corner[0] > self.CAM_WIDTH  - limit or
+                    corner[1] < limit or corner[1] > self.CAM_HEIGHT - limit):
+                return False
+        return True
+
+    def _mono_from_last_obs(
+        self, R_drone_to_world: R, T_drone_to_world: np.ndarray
+    ) -> List[GateEstimate]:
+        if not self._observations:
+            return []
+        last = self._observations[-1]
+        return self.mono_gate_positions(
+            [last.gate_corners], R_drone_to_world, T_drone_to_world
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Diagnostics                                                         #
+    # ------------------------------------------------------------------ #
+
+    def clear_observations(self) -> None:
+        """Flush the observation buffer (e.g. after crossing a gate)."""
+        self._observations.clear()
+
+    def observation_count(self) -> int:
+        return len(self._observations)
+    
 class Tracker:
     def __init__ (self):
         self.reset()
@@ -636,12 +1314,22 @@ class Tracker:
         self.timer = None
         self.timer_done = None
         self.repeat = False
+
+    def load (self, timepoints, setpoints, vel_setpoints, acc_setpoints):
+        self.timepoints = timepoints
+        self.setpoints = setpoints
+        self.vel_sp = vel_setpoints
+        self.acc_sp = acc_setpoints
         
-    def trajectory_tracking(self, sensor_data, dt, timepoints, setpoints, tol, repeat = None):
+    def trajectory_tracking(
+            # self, sensor_data, dt, timepoints, setpoints, critic_sepoints=None, tol=1e-1, repeat = None):
+            self, sensor_data, dt, tol=1e-1, repeat = None, method=1):
         repeat = self.repeat if repeat is None else repeat
 
-        start_point = setpoints[0]
-        end_point = setpoints[-1]
+        show = len(self.setpoints) > 4
+
+        start_point = self.setpoints[0]
+        end_point = self.setpoints[-1]
 
         if self.timer is None:
             # Begin timer and start trajectory
@@ -653,11 +1341,69 @@ class Tracker:
 
         # Determine the current setpoint based on the time
         if self.timer is not None:
-            if self.index_current_setpoint < len(timepoints) - 1:
+            if self.index_current_setpoint < len(self.timepoints) - 1:
                 # Update new setpoint
-                if self.timer >= timepoints[self.index_current_setpoint]:
-                    self.index_current_setpoint += 1
-                current_setpoint = setpoints[self.index_current_setpoint,:]
+                # Method 1
+                # if self.timer >= self.timepoints[self.index_current_setpoint]:
+                #     self.index_current_setpoint += 1
+                current_setpoint = np.concatenate((
+                    self.setpoints[self.index_current_setpoint,:],
+                    self.vel_sp[self.index_current_setpoint],
+                    self.acc_sp[self.index_current_setpoint]
+                ))
+
+                # Method 2
+                if method == 2:
+                    # current_setpoint = self.setpoints[self.index_current_setpoint,:]
+                    # if self.timer >= self.timepoints[self.index_current_setpoint]:
+                    #     if critic_sepoints is not None and critic_sepoints[self.index_current_setpoint]:
+                    #         verify_distance = (
+                    #             abs(sensor_data['x_global'] - current_setpoint[0]) < 0.12
+                    #             and abs(sensor_data['y_global'] - current_setpoint[1]) < 0.12
+                    #             and abs(sensor_data['z_global'] - current_setpoint[2]) < 0.12
+                    #         )
+
+                    #         if verify_distance:
+                    #             self.index_current_setpoint += 1
+                    #     else:
+                    #         self.index_current_setpoint += 1
+                    pass
+
+                # Method 3
+                elif method == 3:
+                    current_setpoint = self.setpoints[self.index_current_setpoint,:]
+                    verify_distance = (
+                        abs(sensor_data['x_global'] - current_setpoint[0]) < 0.12
+                        and abs(sensor_data['y_global'] - current_setpoint[1]) < 0.12
+                        and abs(sensor_data['z_global'] - current_setpoint[2]) < 0.12
+                    )
+                    if verify_distance:
+                        self.index_current_setpoint += 1
+
+                # Method 4
+                elif method == 4:
+                    POS_TOL      = 0.20   # m  — must be within this to advance
+                    TIME_TIMEOUT = 1.5    # s  — advance anyway after this much extra time (safety)
+
+                    actual_pos = np.array([
+                        sensor_data['x_global'], sensor_data['y_global'], 
+                        sensor_data['z_global'], sensor_data['yaw']]
+                    )
+                    current_sp_pos = self.setpoints[self.index_current_setpoint, :3]
+                    pos_error      = np.linalg.norm(actual_pos[:3] - current_sp_pos)
+
+                    time_due    = self.timer >= self.timepoints[self.index_current_setpoint]
+                    close_enough = pos_error < POS_TOL
+                    timed_out   = self.timer >= self.timepoints[self.index_current_setpoint] + TIME_TIMEOUT
+
+                    if (time_due and close_enough) or timed_out:
+                        self.index_current_setpoint += 1
+                else:
+                    # Method 1
+                    if self.timer >= self.timepoints[self.index_current_setpoint]:
+                        self.index_current_setpoint += 1
+                    current_setpoint = self.setpoints[self.index_current_setpoint,:]
+
             else:
                 # Hover at the final setpoint
                 current_setpoint = end_point
@@ -681,6 +1427,8 @@ class MotionPlanner3D():
     
     def __init__(self):
         self.trajectory_setpoints = None
+        self.velocity_setpoints = None
+        self.acceleration_setpoints = None
         self.obstacles = []
         self.final_time = 3.5
 
@@ -700,30 +1448,33 @@ class MotionPlanner3D():
 
         self.run_planner(self.path)
 
-    def run_planner(self, path_waypoints):    
+    def run_planner(self, path_waypoints, **kwargs):    
         # Run the subsequent functions to compute the polynomial coefficients and extract and visualize the trajectory setpoints
 
-        self.init_params(path_waypoints)
+        self.init_params(path_waypoints, **kwargs)
         poly_coeffs = self.compute_poly_coefficients(path_waypoints)
-        self.trajectory_setpoints, self.time_setpoints, _ = self.poly_setpoint_extraction(poly_coeffs, self.obstacles, path_waypoints)
+        # self.trajectory_setpoints, self.time_setpoints, self.critic_setpoint, _ = \
+        self.trajectory_setpoints, self.time_setpoints, self.velocity_setpoints, self.acceleration_setpoints, _ = \
+            self.poly_setpoint_extraction(poly_coeffs, self.obstacles, path_waypoints)
 
         ## ---------------------------------------------------------------------------------------------------- ##
 
     def run_planner_opt (self, path_waypoints):
 
         tol = 1e-2
-        learn_vel = 0.1
+        learn_vel = 0.2
         learn_acc = 0.1
         t = 10
         done = False
 
         trajectory_setpoint, time_setpoint = None, None
+        count = 0
 
         while not done:
             # Copmute trajectory
             self.init_params(path_waypoints, t_final=t)
             poly_coeffs = self.compute_poly_coefficients(path_waypoints)
-            traj_set, time_set, info = self.poly_setpoint_extraction(poly_coeffs, self.obstacles, path_waypoints)
+            traj_set, time_set, _, _, info = self.poly_setpoint_extraction(poly_coeffs, self.obstacles, path_waypoints)
 
             result, msg = self.check_limits(info)
             if result:
@@ -747,6 +1498,10 @@ class MotionPlanner3D():
                 done = True
                 print (msg)
 
+            count += 1
+
+        print ("Trajectory computed in", count, "steps")
+
         self.trajectory_setpoints, self.time_setpoints = trajectory_setpoint, time_setpoint
 
     def init_params(self, path_waypoints, t_final=None):
@@ -755,7 +1510,7 @@ class MotionPlanner3D():
         # - path_waypoints: The sequence of input path waypoints provided by the path-planner, including the start and final goal position: Vector of m waypoints, consisting of a tuple with three reference positions each as provided by AStar
 
         # TUNE THE FOLLOWING PARAMETERS (PART 2) ----------------------------------------------------------------- ##
-        self.disc_steps = 20 #Integer number steps to divide every path segment into to provide the reference positions for PID control # IDEAL: Between 10 and 20
+        self.disc_steps = 10 #Integer number steps to divide every path segment into to provide the reference positions for PID control # IDEAL: Between 10 and 20
         self.vel_lim = 7.0 #Velocity limit of the drone (m/s)
         self.acc_lim = 50.0 #Acceleration limit of the drone (m/s²)
         t_f = self.final_time if t_final is None else t_final
@@ -906,9 +1661,20 @@ class MotionPlanner3D():
 
         yaw_vals = np.zeros((self.disc_steps*len(self.times),1))
         trajectory_setpoints = np.hstack((x_vals, y_vals, z_vals, yaw_vals))
+        velocity_setpoints = np.hstack((v_x_vals, v_y_vals, v_z_vals))
+        acceleration_setpoints = np.hstack((a_x_vals, a_y_vals, a_z_vals))
+        
+        # setpoint_is_waypoint = []
+        # TOCLEAN: Add critical points
+        # for point in trajectory_setpoints:
+        #     for waypoint in path_waypoints:
+        #         if np.linalg.norm(point[:3] - waypoint[:3]) < 0.25:
+        #             setpoint_is_waypoint.append(True)
+        #         else:
+        #             setpoint_is_waypoint.append(False)
 
-        if len(path_waypoints) > 3:
-            self.plot(obs, path_waypoints, trajectory_setpoints)
+        # if len(path_waypoints) > 3:
+            # self.plot(obs, path_waypoints, trajectory_setpoints)
             
         # Find the maximum absolute velocity during the segment
         vel_max = np.max(np.sqrt(v_x_vals**2 + v_y_vals**2 + v_z_vals**2))
@@ -928,13 +1694,13 @@ class MotionPlanner3D():
         }
         # ---------------------------------------------------------------------------------------------------- ##
 
-        return trajectory_setpoints, time_setpoints, info
+        return trajectory_setpoints, time_setpoints, velocity_setpoints, acceleration_setpoints, info
     
     def check_limits (self, info) -> Tuple[bool, str]:
         # Check that it is less than an upper limit velocity v_lim
-        if info["vel"]["max"] <= self.vel_lim:
+        if info["vel"]["max"] > self.vel_lim:
             return False, "The drone velocity exceeds the limit velocity : " + str(info["vel"]["max"]) + " m/s"
-        if info["acc"]["max"] <= self.acc_lim:
+        if info["acc"]["max"] > self.acc_lim:
             return False, "The drone acceleration exceeds the limit acceleration : " + str(info["acc"]["max"]) + " m/s²"
         return True, ""
     
@@ -984,6 +1750,7 @@ class MotionPlanner3D():
 
 class Keeper ():
     def __init__ (self, value_default=0):
+        self.default = value_default
         self.value = value_default
         self.last = value_default
 
@@ -1010,7 +1777,7 @@ class Keeper ():
 
 # Module-level singleton so main.py can call assignment.get_command() unchanged
 _controller = MyAssignment()
-_detector = GatesDetector()
+_detector = GatesDetectorTriangulation()
 
 def get_command(sensor_data, camera_data, dt):
     return _controller.compute_command(sensor_data, camera_data, dt)
@@ -1034,6 +1801,7 @@ def draw_stats(image: np.ndarray = None) -> np.ndarray:
         f"Gate idx: {_controller.idx_gate_search}",
         f"Target: {np.round(_controller.target_control_command, 2) if _controller.target_control_command is not None else 'None'}",
         f"Command: {np.round(_controller.last_command, 2)}",
+        f"Len Gates Detected: {len(_controller.pos_gates)}",
     ]
 
     # Semi-transparent background

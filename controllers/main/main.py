@@ -31,6 +31,10 @@ running = True
 
 np.random.seed(0)
 random.seed(2)
+# 0, 0: almost a circle
+# 0, 1: gate 3 super far
+# 0, 2: good one to test trayectory bounded case
+# 
 
 # Crazyflie drone class in webots
 class CrazyflieInDroneDome(Supervisor):

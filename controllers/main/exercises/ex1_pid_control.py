@@ -10,6 +10,7 @@ class quadrotor_controller():
     def __init__(self, exp_num):
         # Exercise 1: Choose what to tune ["vel_z", "pos_z", "vel_xy", "pos_xy"]
         self.tuning_level = "off" #"off" to disable tuning
+        self.feedforward_controller = True
         
         # Only change the gains you are asked to, the others are already tuned by us (INITIAL GAINS)
         # gains = {
@@ -137,6 +138,10 @@ class quadrotor_controller():
 
         # To check what is in sensor_data, look at main.py -> def read_sensors(self)
 
+        # Feedforward path
+        # if self.feedforward_controller and len(setpoint) == 10:
+        #     return self.feedforward_to_pwm(dt, setpoint, sensor_data)
+
         ### Position control loop ###
         # For tuning
         if self.tuning_level == "pos_xy":
@@ -182,6 +187,111 @@ class quadrotor_controller():
         yaw_setpoint = setpoint[3]
         return self.acceleration_and_yaw_to_pwm(dt, [acc_x_setpoint, acc_y_setpoint, acc_z_setpoint], yaw_setpoint, sensor_data)
         ### END EXERCISE 1 SOLUTION ###
+
+    def feedforward_to_pwm(self, dt, setpoint, sensor_data):
+        """
+        Feedforward + PID cascade for trajectory following.
+
+        Receives a length-10 setpoint produced by the trajectory tracker:
+            setpoint = [x, y, z, yaw,  vx, vy, vz,  ax, ay, az]  (inertial frame)
+
+        Architecture
+        ────────────
+        Layer 1 – Position PID  →  corrective velocity  (inertial)
+                  The FF velocity is used as the *setpoint baseline*, not added
+                  on top of the PID output.  The PID only corrects the residual
+                  error between actual position and reference position.
+
+                  vel_setpoint_inertial = K_ff_vel * vel_ff
+                                        + vel_PID(pos_error)   [clipped]
+
+        Layer 2 – Velocity PID  →  corrective acceleration (body)
+                  The FF acceleration (rotated to body) is added as a small
+                  scaled bias so the drone anticipates corners without
+                  aggressively tilting.
+
+                  acc_cmd_body = acc_PID(vel_error_body)
+                               + K_ff_acc * R_i2b @ acc_ff     [clipped]
+
+        Layer 3 – attitude + rate PIDs (via acceleration_and_yaw_to_pwm,
+                  completely unchanged).
+
+        Tuning knobs
+        ────────────
+        K_ff_vel  (0 → 1)  Start at 0, raise until corners stop being cut.
+                            At 1 the drone tries to fully match planner velocity.
+        K_ff_acc  (0 → 1)  Start at 0, raise carefully — this directly tilts
+                            the drone.  Even 0.2–0.3 is usually enough.
+        """
+        # ── Feedforward gains — tune these, not the PIDs ─────────────────
+        K_ff_vel = 0.5   # velocity feedforward weight  [0 → 1]
+        K_ff_acc = 0.2   # acceleration feedforward weight [0 → 1]
+
+        # ── Unpack setpoint ──────────────────────────────────────────────
+        pos_ref = np.array(setpoint[0:3])   # [x, y, z]  inertial
+        yaw_ref = setpoint[3]
+        vel_ff  = np.array(setpoint[4:7])   # planner velocity   [m/s]  inertial
+        acc_ff  = np.array(setpoint[7:10])  # planner acceleration [m/s²] inertial
+
+        # ── Rotation matrices ────────────────────────────────────────────
+        R_current          = R.from_quat([sensor_data["q_x"], sensor_data["q_y"],
+                                          sensor_data["q_z"], sensor_data["q_w"]])
+        R_body_to_inertial = R_current.as_matrix()
+        R_inertial_to_body = R_body_to_inertial.T
+
+        # ── Layer 1: position PID gives corrective velocity ──────────────
+        # The FF velocity shifts the velocity setpoint baseline; the PID
+        # only corrects the remaining position error on top of that.
+        self.pid_pos_x.set_setpoint(pos_ref[0])
+        self.pid_pos_y.set_setpoint(pos_ref[1])
+        self.pid_pos_z.set_setpoint(pos_ref[2])
+
+        vel_pid_x = self.pid_pos_x.call(sensor_data["x_global"], dt=dt)
+        vel_pid_y = self.pid_pos_y.call(sensor_data["y_global"], dt=dt)
+        vel_pid_z = self.pid_pos_z.call(sensor_data["z_global"], dt=dt)
+
+        # FF velocity baseline + PID correction, then clip to safety limits
+        vel_cmd_inertial = np.array([
+            K_ff_vel * vel_ff[0] + vel_pid_x,
+            K_ff_vel * vel_ff[1] + vel_pid_y,
+            K_ff_vel * vel_ff[2] + vel_pid_z,
+        ])
+        vel_cmd_inertial[:2] = np.clip(vel_cmd_inertial[:2],
+                                       -self.limits["L_vel_xy"],
+                                        self.limits["L_vel_xy"])
+        vel_cmd_inertial[2]  = np.clip(vel_cmd_inertial[2],
+                                       -self.limits["L_vel_z"],
+                                        self.limits["L_vel_z"])
+
+        # Rotate combined velocity command into body frame
+        vel_cmd_body = R_inertial_to_body @ vel_cmd_inertial
+
+        # ── Layer 2: velocity PID gives corrective acceleration ──────────
+        self.pid_vel_x.set_setpoint(vel_cmd_body[0])
+        self.pid_vel_y.set_setpoint(vel_cmd_body[1])
+        self.pid_vel_z.set_setpoint(vel_cmd_body[2])
+
+        acc_pid_x = self.pid_vel_x.call(sensor_data["v_forward"], dt=dt)
+        acc_pid_y = self.pid_vel_y.call(sensor_data["v_left"],    dt=dt)
+        acc_pid_z = self.pid_vel_z.call(sensor_data["v_up"],      dt=dt)
+
+        # Scaled FF acceleration in body frame added as a gentle bias.
+        # Clip to the same roll/pitch limits the velocity PID already uses so
+        # the attitude loop never receives a command it can't handle.
+        acc_ff_body = R_inertial_to_body @ acc_ff
+        acc_cmd_body = np.array([
+            acc_pid_x + K_ff_acc * acc_ff_body[0],
+            acc_pid_y + K_ff_acc * acc_ff_body[1],
+            acc_pid_z + K_ff_acc * acc_ff_body[2],
+        ])
+        acc_cmd_body[:2] = np.clip(acc_cmd_body[:2],
+                                   -self.limits["L_acc_rp"],
+                                    self.limits["L_acc_rp"])
+
+        # ── Layer 3: attitude + rate (unchanged) ─────────────────────────
+        return self.acceleration_and_yaw_to_pwm(
+            dt, acc_cmd_body.tolist(), yaw_ref, sensor_data
+        )
     
     def keys_to_pwm(self, dt, keys, sensor_data):
         # keys = acc_x, acc_y, altitude, yaw
