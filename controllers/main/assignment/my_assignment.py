@@ -65,6 +65,7 @@ class MyAssignment:
         
         self.pos_gates = []
         self.idx_gate_search = 0
+        self.idx_gate_fast = 0
         self.trajectory = []
         self.last_command = self.INIT_POS
         self.target_control_command = None
@@ -129,12 +130,12 @@ class MyAssignment:
         # ---- YOUR CODE HERE ----
             if self.mode_trajectory != 0: # Trajectory (priority)
                 control_command = self.get_next_waypoint (sensor_data, dt)
-            elif self.mode == 0: # TODO: Searching
+            elif self.mode == 0: # Searching
                 control_command = self.search_gates (sensor_data, camera_data, dt)
             elif self.mode == 1: # Go to segment 0
-                control_command = self.INIT_POS # TODO: check the last gate is pathing throug correctly
+                control_command = self.INIT_POS
             elif self.mode == 2: # TODO: Fast mode
-                control_command = self.fast_mode (sensor_data, camera_data)
+                control_command = self.fast_mode (sensor_data, camera_data, dt)
             else: # TODO: Finish
                 control_command = self.dancing (sensor_data)
 
@@ -315,6 +316,8 @@ class MyAssignment:
                     if self._mono_gate_cmd is not None:
                         dir_to_gate = self._mono_gate_cmd[:2] - actual_pos[:2]
                         control_command[3] = np.arctan2(dir_to_gate[1], dir_to_gate[0])
+                    else:
+                        control_command[3] += np.deg2rad(12)
             else: 
                 # Trajectory finished → check data quality
                 n_obs = len(self._obs_buffer)
@@ -446,34 +449,58 @@ class MyAssignment:
  
         return control_command
 
-    def fast_mode (self, sensor_data, camera_data):
+    def fast_mode (self, sensor_data, camera_data, dt):
         # TODO: do trayectory and look for the gates, ensure passing through
         # Default values
         actual_pos = np.array([
-            sensor_data['x_global'], sensor_data['y_global'], 
-            sensor_data['z_global'], sensor_data['yaw']]
-        )
+            sensor_data['x_global'], sensor_data['y_global'],
+            sensor_data['z_global'], sensor_data['yaw'],
+        ])
+        control_command = actual_pos.copy()
+ 
         if self.mode_fast == 0:
             # set trajectory
-            self.trajectory = [
-                actual_pos[:3],
-                *[pos[:3] for pos in self.pos_gates],
-                self.INIT_POS[:3]
-            ]
+            self.trajectory = self._sort_trajectory(
+                actual_pos,
+                [pos for pos in self.pos_gates],
+                self.INIT_POS
+            )
 
-            # Set parameters for trajectory
-            self.mp.final_time = 10
-            self.tracker.repeat = True
+            # Compute trajectory
+            self.run_planner(self.trajectory, t_final=10)
 
             # Update modes
-            self.mode_trajectory.set(2)
-            self.mode_fast.set(1)
+            self.mode_trajectory.set(3)
+            self.mode_fast.set(2)
 
         elif self.mode_fast == 1:
-            # Keep going
-            pass
+            # Follow trayectory:
+            control_command, done = self.tracker.trajectory_tracking (
+                sensor_data, dt, tol=1, method=3)
+            
+            # Look gate
+            dir_to_gate = self.pos_gates[self.idx_gate_fast][:3] - actual_pos[:3]
+            control_command[3] = np.arctan2(dir_to_gate[1], dir_to_gate[0])
+            control_command[:3] = self.pos_gates[self.idx_gate_fast][:3]
 
-        return actual_pos
+            # If we are near to the gate => go to them
+            if np.linalg.norm(dir_to_gate) < 1:
+                control_command = np.concatenate([
+                    self.pos_gates[self.idx_gate_fast][:3],
+                    [actual_pos[3]]
+                ])
+            
+            # If we achieve the gate => go to next gate
+            if self._achieve_goal(actual_pos[:3], self.pos_gates[self.idx_gate_fast][:3]):
+                if self.idx_gate_fast + 1 >= len(self.pos_gates):
+                    self.mode_fast.set(2)
+                else:
+                    self.idx_gate_fast += 1
+        elif self.mode_fast == 2:
+            # Go home
+            control_command = self.INIT_POS
+
+        return control_command
 
     def get_next_waypoint (self, sensor_data, dt) -> Tuple[bool, np.ndarray]:
         # Follow the trajectory until finish
@@ -679,7 +706,67 @@ class MyAssignment:
                     detected = True
             if not detected:
                 print ("> WARNING: Gate in segment", segment_gate, "not detected.")
-                
+
+    def _get_near_os_far_pos (self, pos, *args, min_or_max = -1):
+        """
+        Get the near poisitions in args
+        
+        :param pos: Position from measurements
+        :param args: positions to compare
+        :param min_or_max: 1 to search max distance, -1 to search min distance
+        """
+        idx_min = 0
+        save_dist = - np.inf
+
+        for i, point in enumerate(args):
+            dist = np.linalg.norm (pos - point) * min_or_max
+
+            if save_dist < dist:
+                idx_min = i
+                save_dist = dist
+
+        return args[idx_min]
+    
+    def _sort_trajectory(self, init_pos, waypoints, end_pos, dist=1):
+        """
+        Sort waypoints to get the minimal distance path through gates.
+        
+        Each gate contributes 2 waypoints (front and back). We choose the order
+        (front→back or back→front) that minimizes total trajectory length.
+        
+        :param init_pos: init position (np.array)
+        :param waypoints: list of gate center positions
+        :param end_pos: end point (np.array)
+        :return: sorted list of waypoints
+        """
+        trajectory = [init_pos]
+        current_pos = init_pos
+
+        for i, gate_pos in enumerate(waypoints):
+            front = self._compute_space_to_pos(gate_pos, -dist)
+            back  = self._compute_space_to_pos(gate_pos,  dist)
+
+            next_waypoint = waypoints[i + 1] if i + 1 < len(waypoints) else end_pos
+
+            # Option A: approach front first, exit through back
+            cost_a = (np.linalg.norm((current_pos - front)[:2]) +
+                    np.linalg.norm((next_waypoint - back)[:2]))
+
+            # Option B: approach back first, exit through front
+            cost_b = (np.linalg.norm((current_pos - back)[:2]) +
+                    np.linalg.norm((next_waypoint - front)[:2]))
+
+            if cost_a <= cost_b:
+                trajectory.extend([front, waypoints[i], back])
+                current_pos = back
+            else:
+                trajectory.extend([back, waypoints[i], front])
+                current_pos = front
+
+        trajectory += [end_pos]
+        return trajectory
+
+    
 class GatesDetector:
 
     CAM_FIELD_OF_VIEW = 1.5
@@ -1369,13 +1456,13 @@ class Tracker:
                     #         self.index_current_setpoint += 1
                     pass
 
-                # Method 3
+                # Method 3: pos tracker
                 elif method == 3:
                     current_setpoint = self.setpoints[self.index_current_setpoint,:]
                     verify_distance = (
-                        abs(sensor_data['x_global'] - current_setpoint[0]) < 0.12
-                        and abs(sensor_data['y_global'] - current_setpoint[1]) < 0.12
-                        and abs(sensor_data['z_global'] - current_setpoint[2]) < 0.12
+                        abs(sensor_data['x_global'] - current_setpoint[0]) < tol
+                        and abs(sensor_data['y_global'] - current_setpoint[1]) < tol
+                        and abs(sensor_data['z_global'] - current_setpoint[2]) < tol
                     )
                     if verify_distance:
                         self.index_current_setpoint += 1
@@ -1399,7 +1486,7 @@ class Tracker:
                     if (time_due and close_enough) or timed_out:
                         self.index_current_setpoint += 1
                 else:
-                    # Method 1
+                    # Method 1: time tracker
                     if self.timer >= self.timepoints[self.index_current_setpoint]:
                         self.index_current_setpoint += 1
                     current_setpoint = self.setpoints[self.index_current_setpoint,:]
@@ -1797,10 +1884,12 @@ def draw_stats(image: np.ndarray = None) -> np.ndarray:
     stats = [
         f"Mode: {_controller.mode}",
         f"Mode Search: {_controller.mode_searching}",
+        f"Mode Fast: {_controller.mode_fast}",
         f"Mode Traj: {_controller.mode_trajectory}",
         f"Gate idx: {_controller.idx_gate_search}",
         f"Target: {np.round(_controller.target_control_command, 2) if _controller.target_control_command is not None else 'None'}",
-        f"Command: {np.round(_controller.last_command, 2)}",
+        "Command:",
+        f" {np.round(_controller.last_command, 2)}",
         f"Len Gates Detected: {len(_controller.pos_gates)}",
     ]
 

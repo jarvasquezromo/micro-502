@@ -30,7 +30,7 @@ setpoint_lock = threading.Lock()
 running = True
 
 np.random.seed(0)
-random.seed(2)
+random.seed(3)
 # 0, 0: almost a circle
 # 0, 1: gate 3 super far
 # 0, 2: good one to test trayectory bounded case
@@ -732,11 +732,10 @@ if __name__ == '__main__':
                         # Read the camera feed
                         camera_data = drone.read_camera()
                         detection = assignment.show_mask(camera_data, drone)
-                        stats = assignment.draw_stats(camera_data)
+                        stats = assignment.draw_stats(camera_data.copy())
 
-                        cv2.imshow ("Real camera", camera_data)
+                        cv2.imshow ("Stats", stats)
                         cv2.imshow ("Detection", detection)
-                        # cv2.imshow ("Stats", stats)
                         cv2.waitKey(1)
                         
                         # Update the sensor data in the thread
